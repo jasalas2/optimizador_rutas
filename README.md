@@ -3,7 +3,7 @@
 Calcula la ruta óptima de recolección con horarios estimados, peso por
 parada, mapa interactivo y exportación a CSV / Google Maps.
 
-## Novedades de esta versión (Fase 1)
+## Novedades de esta versión (Fase 2)
 
 - **Persistencia con SQLite** (`rutas.db`): los puntos de recolección y la
   configuración (hora de inicio, velocidad, capacidad, depot) ya no se
@@ -47,7 +47,7 @@ instalar nada:
 > inesperadamente, el siguiente paso sería mover la base de datos a algo
 > persistente de verdad (ej. Supabase o Turso, ambos con plan gratuito).
 
-## Próximos pasos (Fase 2 — multi-camión)
+## Próximos pasos (Fase 3 — multi-camión)
 
 La tabla `puntos` en `db.py` ya incluye una columna `camion_asignado`
 (vacía por ahora), pensada para cuando se agregue optimización con
