@@ -108,15 +108,36 @@ def obtener_ruta_osrm(origen, destino):
         return [origen, destino], haversine(origen, destino), f"error inesperado ({e})"
 
 
-def resolver_vrp(distancias):
-    manager = pywrapcp.RoutingIndexManager(len(distancias), 1, 0)
+def resolver_vrp_multi(distancias, pesos, num_vehicles, capacidad_por_vehiculo):
+    """Reparte los puntos entre `num_vehicles` camiones respetando la capacidad
+    REAL de cada uno como restricción dura: si un camión se llenaría, el/los
+    puntos restantes se asignan a otro camión con espacio disponible.
+    Si ni sumando toda la flota alcanza la capacidad, esos puntos se descartan
+    (con una penalización alta para que el solver los deje de último recurso)
+    y se devuelven aparte para poder avisarle al usuario.
+    Devuelve (rutas, puntos_no_asignados)."""
+    manager = pywrapcp.RoutingIndexManager(len(distancias), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    def cb(from_idx, to_idx):
+    def dist_cb(from_idx, to_idx):
         return distancias[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
 
-    t = routing.RegisterTransitCallback(cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(t)
+    transit_idx = routing.RegisterTransitCallback(dist_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+    def demand_cb(from_idx):
+        return int(pesos[manager.IndexToNode(from_idx)])
+
+    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_idx, 0, [int(capacidad_por_vehiculo)] * num_vehicles, True, "Carga"
+    )
+
+    # Penalización alta por punto descartado: el solver solo lo hace si de
+    # verdad no hay forma de que ningún camión lo cubra sin pasarse de peso.
+    penalizacion = sum(sum(fila) for fila in distancias) + 1
+    for node in range(1, len(distancias)):
+        routing.AddDisjunction([manager.NodeToIndex(node)], penalizacion)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -125,15 +146,86 @@ def resolver_vrp(distancias):
 
     sol = routing.SolveWithParameters(params)
     if not sol:
-        return None
+        return None, []
 
-    idx = routing.Start(0)
-    ruta = []
-    while not routing.IsEnd(idx):
+    rutas = []
+    for v in range(num_vehicles):
+        idx = routing.Start(v)
+        ruta = []
+        while not routing.IsEnd(idx):
+            ruta.append(manager.IndexToNode(idx))
+            idx = sol.Value(routing.NextVar(idx))
         ruta.append(manager.IndexToNode(idx))
-        idx = sol.Value(routing.NextVar(idx))
-    ruta.append(manager.IndexToNode(idx))
-    return ruta
+        rutas.append(ruta)
+
+    visitados = {n for ruta in rutas for n in ruta}
+    no_asignados = [n for n in range(1, len(distancias)) if n not in visitados]
+    return rutas, no_asignados
+
+
+def construir_resultado_camion(ruta_base, LOCATIONS, NOMBRES, PESOS,
+                                capacidad_max, hora_inicio_dt, velocidad_kmh, tiempo_parada):
+    """Recorre la ruta de un camión en una sola pasada (sin vueltas a mitad de
+    ruta) y arma distancias reales, horarios y pesos. Si el peso total asignado
+    supera la capacidad del camión, se marca como advertencia (no se corta la ruta)."""
+    DEPOT_IDX = 0
+    advertencias = []
+    ultimo_idx = len(ruta_base) - 1
+
+    segmentos = []
+    resumen = []
+    hora_actual = hora_inicio_dt
+    peso_acumulado = 0
+
+    for i, node in enumerate(ruta_base):
+        if i > 0:
+            origen = LOCATIONS[ruta_base[i - 1]]
+            destino = LOCATIONS[node]
+            camino, dist_m, _ = obtener_ruta_osrm(origen, destino)
+            segmentos.append({"camino": camino, "dist_m": dist_m})
+            hora_actual += timedelta(hours=(dist_m / 1000) / velocidad_kmh)
+            dist_tramo = f"{dist_m / 1000:.2f}"
+        else:
+            dist_tramo = "-"
+
+        if node == DEPOT_IDX:
+            parada_label = "🏠 Inicio (Depot)" if i == 0 else "🏠 Fin (Depot)"
+            resumen.append({
+                "Parada": parada_label,
+                "Nombre": NOMBRES[node],
+                "Hora llegada": hora_actual.strftime("%H:%M"),
+                "Peso recogido (kg)": 0,
+                "Peso acumulado (kg)": 0 if i == 0 else peso_acumulado,
+                "Distancia tramo (km)": dist_tramo,
+            })
+        else:
+            peso_nodo = PESOS[node]
+            peso_acumulado += peso_nodo
+            resumen.append({
+                "Parada": f"📦 Parada {i}",
+                "Nombre": NOMBRES[node],
+                "Hora llegada": hora_actual.strftime("%H:%M"),
+                "Peso recogido (kg)": peso_nodo,
+                "Peso acumulado (kg)": peso_acumulado,
+                "Distancia tramo (km)": dist_tramo,
+            })
+            hora_actual += timedelta(minutes=tiempo_parada)
+
+    if peso_acumulado > capacidad_max:
+        advertencias.append(
+            f"⚠️ El peso total asignado a este camión ({peso_acumulado:.0f} kg) "
+            f"supera su capacidad ({capacidad_max} kg)."
+        )
+
+    return {
+        "ruta_nodos": ruta_base,
+        "segmentos": segmentos,
+        "resumen": resumen,
+        "hora_fin": hora_actual.strftime("%H:%M"),
+        "peso_total_dia": peso_acumulado,
+        "dist_total_km": sum(s["dist_m"] for s in segmentos) / 1000,
+        "advertencias": advertencias,
+    }
 
 
 
@@ -311,6 +403,28 @@ def generar_link_google_maps(locations_in_order):
 if "resultados" not in st.session_state:
     st.session_state.resultados = None
 
+DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+
+def dias_de_frecuencia(frecuencia):
+    """Convierte el texto libre de 'Días de recolección' en un set de días válidos.
+    Acepta: 'Todos los días', 'Lunes a Sábado', o una lista separada por comas
+    con cualquier combinación de días (ej. 'Lunes, Jueves')."""
+    if frecuencia is None:
+        return set(DIAS_SEMANA)
+    texto = str(frecuencia).strip()
+    if texto == "" or texto.lower() == "todos los días":
+        return set(DIAS_SEMANA)
+    if texto == "Lunes a Sábado":
+        return set(DIAS_SEMANA) - {"Domingo"}
+    return {p.strip() for p in texto.split(",") if p.strip()}
+
+
+def punto_aplica(frecuencia, dias_seleccionados):
+    """True si el punto (según su frecuencia) recolecta en alguno de los días seleccionados."""
+    return bool(dias_de_frecuencia(frecuencia) & set(dias_seleccionados))
+
+
 # Datos por defecto solo se usan si la base de datos está vacía (primera vez)
 datos_default = pd.DataFrame({
     "Nombre":     ["Punto 1", "Punto 2", "Punto 3", "Punto 4", "Punto 5", "Punto 6"],
@@ -318,13 +432,21 @@ datos_default = pd.DataFrame({
     "Latitud":    [9.934804, 9.936133, 9.931150, 9.979572, 10.016073, 9.996015],
     "Longitud":   [-84.081784, -84.082634, -84.093640, -84.152163, -84.215665, -84.118091],
     "Peso (kg)":  [50, 80, 120, 60, 90, 110],
+    "Días de recolección": ["Todos los días"] * 6,
 })
+
+
 
 if db.hay_puntos_guardados():
     datos_iniciales = db.cargar_puntos()
 else:
     datos_iniciales = datos_default
     db.guardar_puntos(datos_default)
+
+# Fallback defensivo: si la base de datos es de una versión anterior a esta
+# columna y por algún motivo no se migró, se agrega acá para no romper la app.
+if "Días de recolección" not in datos_iniciales.columns:
+    datos_iniciales["Días de recolección"] = "Todos los días"
 
 # ─────────────────────────────────────────────
 # SIDEBAR — configuración (con valores guardados como default)
@@ -351,8 +473,18 @@ with st.sidebar:
         value=int(db.obtener_config("tiempo_parada", 10)),
     )
     capacidad_max = st.number_input(
-        "📦 Capacidad máxima (kg)", min_value=1,
+        "📦 Capacidad por camión (kg)", min_value=1,
         value=int(float(db.obtener_config("capacidad_max", 1000))),
+    )
+
+    st.divider()
+    st.header("🚛 Flota")
+    num_camiones = st.number_input(
+        "Número de camiones disponibles", min_value=1, max_value=20,
+        value=int(db.obtener_config("num_camiones", 1)),
+    )
+    st.caption(
+        "Los puntos se reparten entre los camiones disponibles balanceando por peso."
     )
 
     st.divider()
@@ -370,10 +502,12 @@ with st.sidebar:
             velocidad_kmh=velocidad_kmh,
             tiempo_parada=tiempo_parada,
             capacidad_max=capacidad_max,
+            num_camiones=num_camiones,
             depot_lat=depot_lat,
             depot_lon=depot_lon,
         )
         st.success("Configuración guardada ✅")
+
 
 # ─────────────────────────────────────────────
 # TABLA DE PUNTOS
@@ -393,6 +527,13 @@ tabla = st.data_editor(
         "Longitud":  st.column_config.NumberColumn(format="%.6f"),
         "Peso (kg)": st.column_config.NumberColumn(min_value=0),
         "Dirección": st.column_config.TextColumn(width="large"),
+        "Días de recolección": st.column_config.TextColumn(
+            width="medium",
+            help=(
+                "'Todos los días', 'Lunes a Sábado', o cualquier combinación separada "
+                "por comas, ej: 'Lunes, Jueves' o 'Martes, Viernes, Domingo'."
+            ),
+        ),
     },
     key="editor_puntos",
 )
@@ -431,83 +572,89 @@ with col_g2:
         st.success("Puntos guardados ✅")
 
 # ─────────────────────────────────────────────
+# DÍA(S) A CALCULAR
+# ─────────────────────────────────────────────
+st.subheader("📅 Día(s) a calcular")
+hoy_idx = datetime.today().weekday()  # 0 = Lunes ... 6 = Domingo
+dias_calculo = st.multiselect(
+    "Solo se incluirán en la ruta los puntos programados para alguno de estos días",
+    options=DIAS_SEMANA, default=[DIAS_SEMANA[hoy_idx]],
+)
+
+# ─────────────────────────────────────────────
 # BOTÓN CALCULAR
 # ─────────────────────────────────────────────
 if st.button("🔍 Calcular Ruta Óptima", type="primary", use_container_width=True):
+    if not dias_calculo:
+        st.error("Elegí al menos un día para calcular la ruta.")
+        st.stop()
+
     db.guardar_puntos(tabla)  # guardar antes de calcular, por si se cierra la app
-    puntos = tabla.dropna(subset=["Latitud", "Longitud"])
+    puntos_validos = tabla.dropna(subset=["Latitud", "Longitud"])
+    if "Días de recolección" in puntos_validos.columns:
+        col_frecuencia = puntos_validos["Días de recolección"]
+    else:
+        col_frecuencia = pd.Series("Todos los días", index=puntos_validos.index)
+    puntos = puntos_validos[col_frecuencia.apply(lambda f: punto_aplica(f, dias_calculo))]
+
+    dias_texto = ", ".join(dias_calculo)
     if len(puntos) < 2:
-        st.error("Necesitas al menos 2 puntos de recolección con coordenadas válidas.")
+        st.error(
+            f"Necesitas al menos 2 puntos programados para **{dias_texto}** con coordenadas válidas "
+            f"(hay {len(puntos)}). Revisá la columna 'Días de recolección' de la tabla."
+        )
         st.stop()
 
     DEPOT = (depot_lat, depot_lon)
     LOCATIONS = [DEPOT] + list(zip(puntos["Latitud"], puntos["Longitud"]))
     NOMBRES = ["DEPOT"] + puntos["Nombre"].tolist()
-    PESOS = [0] + puntos["Peso (kg)"].tolist()
+    # Peso: cualquier celda vacía/NaN se trata como 0 kg, no como "nan".
+    pesos_validos = pd.to_numeric(puntos["Peso (kg)"], errors="coerce").fillna(0)
+    PESOS = [0] + pesos_validos.tolist()
 
-    with st.spinner("📡 Consultando OSRM y optimizando ruta..."):
+    with st.spinner("📡 Consultando OSRM y optimizando rutas..."):
         distancias, uso_osrm, error_matriz = obtener_matriz_osrm(LOCATIONS)
-        ruta_nodos = resolver_vrp(distancias)
 
-        if not ruta_nodos:
-            st.error("No se encontró solución para la ruta.")
+        # La capacidad real de cada camión es una restricción dura: si un
+        # camión se llenaría, el/los puntos que sobran se asignan a otro
+        # camión con espacio disponible.
+        resultado_solver = resolver_vrp_multi(distancias, PESOS, num_camiones, capacidad_max)
+
+        if resultado_solver is None or resultado_solver[0] is None:
+            st.error(
+                "No se encontró solución. Probá aumentar la capacidad por camión, "
+                "sumar más camiones, o revisar los puntos cargados."
+            )
             st.stop()
 
-        # Segmentos con ruta real
-        segmentos = []
-        errores_segmentos = []
-        for i in range(len(ruta_nodos) - 1):
-            camino, dist_m, err = obtener_ruta_osrm(LOCATIONS[ruta_nodos[i]], LOCATIONS[ruta_nodos[i + 1]])
-            segmentos.append({"camino": camino, "dist_m": dist_m})
-            if err:
-                errores_segmentos.append(err)
+        rutas_base, no_asignados = resultado_solver
 
-        # Horarios
-        hora_actual = datetime.combine(datetime.today(), hora_inicio)
-        peso_acumulado = 0
-        resumen = []
+        hora_inicio_dt = datetime.combine(datetime.today(), hora_inicio)
+        camiones_resultado = []
+        for idx_camion, ruta_base in enumerate(rutas_base):
+            if len(ruta_base) <= 2:
+                continue  # camión sin puntos asignados
+            resultado = construir_resultado_camion(
+                ruta_base, LOCATIONS, NOMBRES, PESOS,
+                capacidad_max, hora_inicio_dt, velocidad_kmh, tiempo_parada,
+            )
+            resultado["camion"] = idx_camion + 1
+            camiones_resultado.append(resultado)
 
-        for i, node in enumerate(ruta_nodos):
-            if i == 0:
-                resumen.append({
-                    "Parada": "🏠 Inicio (Depot)",
-                    "Nombre": NOMBRES[node],
-                    "Hora llegada": hora_actual.strftime("%H:%M"),
-                    "Peso recogido (kg)": 0,
-                    "Peso acumulado (kg)": 0,
-                    "Distancia tramo (km)": "-",
-                })
-            else:
-                dist_m = segmentos[i - 1]["dist_m"]
-                hora_actual += timedelta(hours=(dist_m / 1000) / velocidad_kmh)
-                es_ultimo = (i == len(ruta_nodos) - 1)
-                peso_parada = PESOS[node] if not es_ultimo else 0
-                peso_acumulado += peso_parada
-
-                resumen.append({
-                    "Parada": "🏠 Fin (Depot)" if es_ultimo else f"📦 Parada {i}",
-                    "Nombre": NOMBRES[node],
-                    "Hora llegada": hora_actual.strftime("%H:%M"),
-                    "Peso recogido (kg)": peso_parada,
-                    "Peso acumulado (kg)": peso_acumulado,
-                    "Distancia tramo (km)": f"{dist_m / 1000:.2f}",
-                })
-
-                if not es_ultimo:
-                    hora_actual += timedelta(minutes=tiempo_parada)
+        if not camiones_resultado:
+            st.error("Ningún camión quedó con puntos asignados. Revisá la configuración.")
+            st.stop()
 
         st.session_state.resultados = {
             "uso_osrm": uso_osrm,
             "error_matriz": error_matriz,
-            "errores_segmentos": errores_segmentos,
-            "ruta_nodos": ruta_nodos,
-            "segmentos": segmentos,
-            "resumen": resumen,
-            "hora_fin": hora_actual.strftime("%H:%M"),
-            "peso_acumulado": peso_acumulado,
+            "camiones": camiones_resultado,
+            "puntos_sin_asignar": [NOMBRES[n] for n in no_asignados],
             "LOCATIONS": LOCATIONS,
             "NOMBRES": NOMBRES,
             "PESOS": PESOS,
+            "dia_calculo": dias_texto,
+            "puntos_excluidos_hoy": len(puntos_validos) - len(puntos),
         }
 
 # ─────────────────────────────────────────────
@@ -515,143 +662,208 @@ if st.button("🔍 Calcular Ruta Óptima", type="primary", use_container_width=T
 # ─────────────────────────────────────────────
 if st.session_state.resultados:
     r = st.session_state.resultados
+    camiones = r["camiones"]
+
+    st.subheader(f"📅 Ruta para: {r['dia_calculo']}")
+    if r["puntos_excluidos_hoy"] > 0:
+        st.caption(
+            f"ℹ️ {r['puntos_excluidos_hoy']} punto(s) no están programados para "
+            f"{r['dia_calculo']} y no se incluyeron en esta ruta."
+        )
 
     if r["uso_osrm"]:
-        st.success("✅ Ruta calculada con distancias reales por carretera (OSRM)")
+        st.success("✅ Rutas calculadas con distancias reales por carretera (OSRM)")
     else:
         st.warning(f"⚠️ Sin distancias reales de OSRM — usando línea recta. Motivo: {r['error_matriz']}")
 
-    if r["errores_segmentos"]:
-        n_fallidos = len(r["errores_segmentos"])
-        st.info(f"ℹ️ {n_fallidos} tramo(s) del mapa usaron línea recta por fallas puntuales de conexión con OSRM.")
+    todas_advertencias = [a for c in camiones for a in c["advertencias"]]
+    for adv in todas_advertencias:
+        st.warning(adv)
 
-    dist_total = sum(s["dist_m"] for s in r["segmentos"]) / 1000
+    if r["puntos_sin_asignar"]:
+        nombres_sin_asignar = ", ".join(r["puntos_sin_asignar"])
+        st.error(
+            f"⚠️ Estos puntos no pudieron asignarse a ningún camión porque la flota no da abasto "
+            f"(ni sumando la capacidad de todos los camiones): **{nombres_sin_asignar}**. "
+            f"Sumá más camiones o aumentá la capacidad por camión para cubrirlos."
+        )
+
+    # ── Resumen general (todos los camiones) ──
+    st.subheader("📊 Resumen general")
+    dist_total_general = sum(c["dist_total_km"] for c in camiones)
+    peso_total_general = sum(c["peso_total_dia"] for c in camiones)
+    hora_fin_general = max(c["hora_fin"] for c in camiones)
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📏 Distancia total", f"{dist_total:.1f} km")
-    col2.metric("🕐 Hora inicio", hora_inicio.strftime("%H:%M"))
-    col3.metric("🕐 Hora fin estimada", r["hora_fin"])
-    excede = r["peso_acumulado"] > capacidad_max
-    col4.metric(
-        "📦 Peso total", f"{r['peso_acumulado']} kg",
-        delta="⚠️ Excede capacidad" if excede else "✅ Dentro del límite",
-        delta_color="inverse" if excede else "normal",
-    )
+    col1.metric("🚛 Camiones usados", f"{len(camiones)} / {num_camiones}")
+    col2.metric("📏 Distancia total", f"{dist_total_general:.1f} km")
+    col3.metric("📦 Peso total recolectado", f"{peso_total_general:.0f} kg")
+    col4.metric("🕐 Hora fin (último camión)", hora_fin_general)
 
-    if excede:
-        st.error(f"⚠️ El peso total ({r['peso_acumulado']} kg) excede la capacidad ({capacidad_max} kg).")
+    # ── Mapa con todas las rutas ──
+    st.subheader("🗺️ Mapa de todas las rutas")
+    todos_lats = [r["LOCATIONS"][n][0] for c in camiones for n in c["ruta_nodos"]]
+    todos_lons = [r["LOCATIONS"][n][1] for c in camiones for n in c["ruta_nodos"]]
+    centro = (sum(todos_lats) / len(todos_lats), sum(todos_lons) / len(todos_lons))
 
-    # Tabla
-    st.subheader("📋 Detalle por parada")
-    df = pd.DataFrame(r["resumen"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    m = folium.Map(location=centro, zoom_start=12, tiles="OpenStreetMap", control_scale=True)
 
-    # Mapa
-    st.subheader("🗺️ Mapa de ruta")
-    lats = [r["LOCATIONS"][n][0] for n in r["ruta_nodos"]]
-    lons = [r["LOCATIONS"][n][1] for n in r["ruta_nodos"]]
-    centro = (sum(lats) / len(lats), sum(lons) / len(lons))
+    folium.TileLayer("OpenStreetMap", name="🗺️ Calles").add_to(m)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri", name="🛰️ Satélite",
+    ).add_to(m)
+    folium.TileLayer("CartoDB dark_matter", name="🌙 Modo oscuro").add_to(m)
 
-    m = folium.Map(location=centro, zoom_start=12, tiles="OpenStreetMap")
+    from folium.plugins import Fullscreen, MiniMap, Geocoder
 
-    for seg in r["segmentos"]:
-        folium.PolyLine(seg["camino"], color="#E74C3C", weight=4, opacity=0.85).add_to(m)
+    Fullscreen(position="topleft", title="Pantalla completa", title_cancel="Salir").add_to(m)
+    MiniMap(toggle_display=True, position="bottomleft").add_to(m)
+    Geocoder(position="topright", collapsed=True).add_to(m)
 
-    for i, node in enumerate(r["ruta_nodos"][:-1]):
-        lat, lon = r["LOCATIONS"][node]
-        hora_parada = r["resumen"][i]["Hora llegada"]
-        if node == 0:
-            folium.Marker(
-                location=[lat, lon],
-                popup="🏠 DEPOT — Inicio/Fin",
-                tooltip="DEPOT",
-                icon=folium.Icon(color="red", icon="home"),
-            ).add_to(m)
-        else:
+    PALETA = ["#E74C3C", "#2980B9", "#27AE60", "#F39C12", "#8E44AD",
+              "#16A085", "#D35400", "#2C3E50", "#C0392B", "#7F8C8D"]
+
+    # Depot: un solo marcador, se comparte entre todos los camiones
+    depot_lat_m, depot_lon_m = r["LOCATIONS"][0]
+    folium.Marker(
+        location=[depot_lat_m, depot_lon_m],
+        popup="🏠 DEPOT — Inicio/Fin",
+        tooltip="DEPOT",
+        icon=folium.Icon(color="red", icon="home"),
+    ).add_to(m)
+
+    for c in camiones:
+        color = PALETA[(c["camion"] - 1) % len(PALETA)]
+        grupo = folium.FeatureGroup(name=f"🚛 Camión {c['camion']}")
+
+        for seg in c["segmentos"]:
+            folium.PolyLine(seg["camino"], color=color, weight=4, opacity=0.85).add_to(grupo)
+
+        for i, node in enumerate(c["ruta_nodos"]):
+            if node == 0:
+                continue  # el depósito (inicio/fin/descargas) ya tiene su propio marcador
+            lat, lon = r["LOCATIONS"][node]
+            hora_parada = c["resumen"][i]["Hora llegada"]
             peso_p = r["PESOS"][node]
-            icon_html = f"""<div style="background:#2980B9;color:white;border-radius:50%;
-                            width:32px;height:32px;display:flex;align-items:center;
-                            justify-content:center;font-size:15px;font-weight:bold;
+            icon_html = f"""<div style="background:{color};color:white;border-radius:50%;
+                            width:30px;height:30px;display:flex;align-items:center;
+                            justify-content:center;font-size:13px;font-weight:bold;
                             border:2px solid white;box-shadow:2px 2px 4px rgba(0,0,0,0.4);">{i}</div>"""
             folium.Marker(
                 location=[lat, lon],
-                popup=f"<b>{r['NOMBRES'][node]}</b><br>⏰ {hora_parada}<br>📦 {peso_p} kg",
-                tooltip=f"{i}. {r['NOMBRES'][node]} — {hora_parada}",
-                icon=folium.DivIcon(html=icon_html, icon_size=(32, 32), icon_anchor=(16, 16)),
-            ).add_to(m)
+                popup=f"<b>{r['NOMBRES'][node]}</b><br>🚛 Camión {c['camion']}<br>⏰ {hora_parada}<br>📦 {peso_p} kg",
+                tooltip=f"Camión {c['camion']} · {i}. {r['NOMBRES'][node]} — {hora_parada}",
+                icon=folium.DivIcon(html=icon_html, icon_size=(30, 30), icon_anchor=(15, 15)),
+            ).add_to(grupo)
 
+        grupo.add_to(m)
+
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
     st_folium(m, use_container_width=True, height=520, returned_objects=[])
 
-    # Exportar
+    # ── Detalle por camión ──
+    st.subheader("📋 Detalle por camión")
+    tabs = st.tabs([f"🚛 Camión {c['camion']}" for c in camiones])
+    for tab, c in zip(tabs, camiones):
+        with tab:
+            tcol1, tcol2, tcol3 = st.columns(3)
+            tcol1.metric("📏 Distancia", f"{c['dist_total_km']:.1f} km")
+            tcol2.metric("📦 Peso recolectado", f"{c['peso_total_dia']:.0f} kg")
+            tcol3.metric("🕐 Hora fin", c["hora_fin"])
+            st.dataframe(pd.DataFrame(c["resumen"]), use_container_width=True, hide_index=True)
+
+    # ── Exportar ──
     st.subheader("⬇️ Exportar")
 
-    orden_locations = [r["LOCATIONS"][n] for n in r["ruta_nodos"]]
+    df_todos = pd.concat(
+        [pd.DataFrame(c["resumen"]).assign(Camión=c["camion"]) for c in camiones],
+        ignore_index=True,
+    )
+    df_todos = df_todos[["Camión"] + [col for col in df_todos.columns if col != "Camión"]]
+    csv_todos = df_todos.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 CSV combinado (todos los camiones)", csv_todos,
+                       "rutas_todos_los_camiones.csv", "text/csv", use_container_width=True)
 
-    # Fila 1: CSV + Google Maps
+    mapa_html = m.get_root().render().encode("utf-8")
+    st.download_button(
+        "🗺️ Mapa interactivo (HTML, para abrir sin internet)",
+        mapa_html, "mapa_rutas.html", "text/html", use_container_width=True,
+    )
+
+    st.divider()
+    st.markdown("**Exportar detalle de un camión específico (GPS / SIG / navegación):**")
+    camion_sel_num = st.selectbox(
+        "Camión a exportar", options=[c["camion"] for c in camiones],
+        format_func=lambda n: f"Camión {n}",
+    )
+    c_sel = next(c for c in camiones if c["camion"] == camion_sel_num)
+    r_sel = {
+        "ruta_nodos": c_sel["ruta_nodos"],
+        "segmentos": c_sel["segmentos"],
+        "resumen": c_sel["resumen"],
+        "LOCATIONS": r["LOCATIONS"],
+        "NOMBRES": r["NOMBRES"],
+        "PESOS": r["PESOS"],
+    }
+    df_sel = pd.DataFrame(c_sel["resumen"])
+    orden_locations = [r["LOCATIONS"][n] for n in c_sel["ruta_nodos"]]
+
     col_e1, col_e2 = st.columns(2)
     with col_e1:
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 CSV (resumen)", csv, "ruta_optima.csv", "text/csv",
+        csv_sel = df_sel.to_csv(index=False).encode("utf-8")
+        st.download_button(f"📥 CSV (Camión {camion_sel_num})", csv_sel,
+                           f"ruta_camion_{camion_sel_num}.csv", "text/csv",
                            use_container_width=True)
     with col_e2:
         link_maps, demasiados_puntos = generar_link_google_maps(orden_locations)
         st.link_button("🗺️ Abrir en Google Maps", link_maps, use_container_width=True)
         if demasiados_puntos:
-            st.caption("⚠️ Mas de 10 paradas: Google Maps solo muestra las primeras 10.")
+            st.caption("⚠️ Más de 10 paradas: Google Maps solo muestra las primeras 10.")
 
-    st.divider()
-    st.markdown("**Exportar para SIG / GPS / navegacion:**")
-
-    # Fila 2: GeoJSON + Shapefile
     col_g1, col_g2 = st.columns(2)
     with col_g1:
-        geojson_bytes = exportar_geojson(r)
+        geojson_bytes = exportar_geojson(r_sel)
         st.download_button("🌐 GeoJSON (QGIS / ArcGIS / web)",
-                           geojson_bytes, "ruta_optima.geojson",
+                           geojson_bytes, f"ruta_camion_{camion_sel_num}.geojson",
                            "application/geo+json", use_container_width=True)
-        st.caption("Abre directo en QGIS, ArcGIS, geojson.io, Felt, etc.")
     with col_g2:
-        shp_bytes = exportar_shapefile(r)
+        shp_bytes = exportar_shapefile(r_sel)
         st.download_button("📦 Shapefile (.zip)",
-                           shp_bytes, "ruta_optima_shp.zip",
+                           shp_bytes, f"ruta_camion_{camion_sel_num}_shp.zip",
                            "application/zip", use_container_width=True)
-        st.caption("Descomprimí el .zip y abrí el .shp en QGIS o ArcGIS.")
 
-    # Fila 3: GPX + KML
     col_g3, col_g4 = st.columns(2)
     with col_g3:
-        gpx_bytes = exportar_gpx(r)
+        gpx_bytes = exportar_gpx(r_sel)
         st.download_button("📡 GPX (GPS / OsmAnd / Garmin)",
-                           gpx_bytes, "ruta_optima.gpx",
+                           gpx_bytes, f"ruta_camion_{camion_sel_num}.gpx",
                            "application/gpx+xml", use_container_width=True)
-        st.caption("Importa en OsmAnd, Maps.me, Garmin BaseCamp, etc.")
     with col_g4:
-        kml_bytes = exportar_kml(r)
+        kml_bytes = exportar_kml(r_sel)
         st.download_button("🌍 KML (Google Earth)",
-                           kml_bytes, "ruta_optima.kml",
+                           kml_bytes, f"ruta_camion_{camion_sel_num}.kml",
                            "application/vnd.google-earth.kml+xml", use_container_width=True)
-        st.caption("Abre en Google Earth o importa en Google My Maps.")
 
-    # Waze
-    with st.expander("Como usar con Waze"):
+    with st.expander(f"Cómo usar con Waze (Camión {camion_sel_num})"):
         st.markdown("""
-Waze **no tiene API publica de multi-paradas** como Google Maps.
-Tenes dos opciones:
+Waze **no tiene API pública de multi-paradas** como Google Maps.
+Tenés dos opciones:
 
-**Opcion A - Parada por parada (desde el celular):**
-El chofer toca el link de la primera parada, llega, cierra Waze, toca el segundo, y asi.
+**Opción A - Parada por parada (desde el celular):**
+El chofer toca el link de la primera parada, llega, cierra Waze, toca el segundo, y así.
 
-**Opcion B - Importar GPX en OsmAnd (recomendado):**
-Descarga el GPX de arriba e importalo en [OsmAnd](https://osmand.net/) (gratis, Android/iOS).
-OsmAnd navega rutas GPX completas con instruccion por voz, igual que Waze.
+**Opción B - Importar GPX en OsmAnd (recomendado):**
+Descargá el GPX de arriba e importalo en [OsmAnd](https://osmand.net/) (gratis, Android/iOS).
+OsmAnd navega rutas GPX completas con instrucción por voz, igual que Waze.
 """)
-        for i, node in enumerate(r["ruta_nodos"]):
+        for i, node in enumerate(c_sel["ruta_nodos"]):
             if node == 0:
                 continue
             lat, lon = r["LOCATIONS"][node]
             nombre = r["NOMBRES"][node]
-            hora = r["resumen"][i]["Hora llegada"]
-            es_ultimo = (i == len(r["ruta_nodos"]) - 1)
+            hora = c_sel["resumen"][i]["Hora llegada"]
+            es_ultimo = (i == len(c_sel["ruta_nodos"]) - 1)
             if not es_ultimo:
                 waze_url = f"https://waze.com/ul?ll={lat},{lon}&navigate=yes"
                 st.markdown(f"**Parada {i} - {nombre}** ({hora}): [Abrir en Waze]({waze_url})")

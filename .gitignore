@@ -2,6 +2,6 @@ __pycache__/
 V2/
 V3/
 *.pyc
-*.db
+rutas.db
 .venv/
 venv/

@@ -24,6 +24,7 @@ DB_TO_UI = {
     "latitud": "Latitud",
     "longitud": "Longitud",
     "peso_kg": "Peso (kg)",
+    "frecuencia": "Días de recolección",
 }
 UI_TO_DB = {v: k for k, v in DB_TO_UI.items()}
 
@@ -49,7 +50,8 @@ def init_db():
                 latitud REAL,
                 longitud REAL,
                 peso_kg REAL DEFAULT 0,
-                camion_asignado TEXT
+                camion_asignado TEXT,
+                frecuencia TEXT DEFAULT 'Todos los días'
             )
         """)
         conn.execute("""
@@ -58,6 +60,10 @@ def init_db():
                 valor TEXT
             )
         """)
+        # Migración: si la base ya existía de antes (sin esta columna), se agrega ahora.
+        columnas = [fila[1] for fila in conn.execute("PRAGMA table_info(puntos)").fetchall()]
+        if "frecuencia" not in columnas:
+            conn.execute("ALTER TABLE puntos ADD COLUMN frecuencia TEXT DEFAULT 'Todos los días'")
 
 
 def hay_puntos_guardados():
@@ -70,9 +76,10 @@ def cargar_puntos():
     """Devuelve un DataFrame con nombres de columna listos para mostrar en la UI."""
     with get_conn() as conn:
         df = pd.read_sql_query(
-            "SELECT nombre, direccion, latitud, longitud, peso_kg FROM puntos ORDER BY id",
+            "SELECT nombre, direccion, latitud, longitud, peso_kg, frecuencia FROM puntos ORDER BY id",
             conn,
         )
+    df["frecuencia"] = df["frecuencia"].fillna("Todos los días")
     return df.rename(columns=DB_TO_UI)
 
 
@@ -81,10 +88,11 @@ def guardar_puntos(df_ui):
     df = df_ui.rename(columns=UI_TO_DB).copy()
     # Asegurar que existan todas las columnas esperadas, aunque el usuario
     # no haya agregado la columna Dirección.
-    for col in ["nombre", "direccion", "latitud", "longitud", "peso_kg"]:
+    for col in ["nombre", "direccion", "latitud", "longitud", "peso_kg", "frecuencia"]:
         if col not in df.columns:
             df[col] = None
-    df = df[["nombre", "direccion", "latitud", "longitud", "peso_kg"]]
+    df = df[["nombre", "direccion", "latitud", "longitud", "peso_kg", "frecuencia"]]
+    df["frecuencia"] = df["frecuencia"].fillna("Todos los días")
     df = df.dropna(subset=["nombre"])  # filas vacías que deja el editor
 
     with get_conn() as conn:
