@@ -21,7 +21,7 @@ Maps, GeoJSON, Shapefile, GPX, KML, Waze).
 - Se mantiene todo lo de la Fase 2: persistencia en SQLite, geocodificación
   de direcciones con Nominatim, y manejo visible de errores de OSRM.
 
-  | Formato | Uso principal |
+| Formato | Uso principal |
 |---|---|
 | CSV | Resumen de la ruta para oficina / reportes |
 | Google Maps (link) | Navegación rápida desde el celular, hasta ~10 paradas intermedias |
