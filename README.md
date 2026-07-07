@@ -4,7 +4,7 @@ Calcula la ruta óptima de recolección con horarios estimados, peso por
 parada, mapa interactivo y exportación a múltiples formatos (CSV, Google
 Maps, GeoJSON, Shapefile, GPX, KML, Waze).
 
-## Novedades de esta versión (Fase 2)
+## Novedades de esta versión (Fase 3)
 
 - **Exportación para SIG / GPS / navegación**, además del CSV y el link a
   Google Maps de la fase anterior:
@@ -20,6 +20,16 @@ Maps, GeoJSON, Shapefile, GPX, KML, Waze).
   importar el GPX en OsmAnd para navegación de ruta completa con voz.
 - Se mantiene todo lo de la Fase 2: persistencia en SQLite, geocodificación
   de direcciones con Nominatim, y manejo visible de errores de OSRM.
+
+  | Formato | Uso principal |
+|---|---|
+| CSV | Resumen de la ruta para oficina / reportes |
+| Google Maps (link) | Navegación rápida desde el celular, hasta ~10 paradas intermedias |
+| GeoJSON | Análisis en QGIS, ArcGIS, geojson.io, Felt |
+| Shapefile (.zip) | Capas de línea y puntos para SIG (QGIS/ArcGIS) |
+| GPX | Navegación GPS completa con voz (OsmAnd, Garmin) |
+| KML | Google Earth / Google My Maps |
+| Waze (links por parada) | Navegación turno por turno, parada por parada |
 
 ## Instalación local
 
@@ -51,18 +61,6 @@ instalar nada:
 > reinicios es aceptable, pero si notás que los datos se resetean
 > inesperadamente, el siguiente paso sería mover la base de datos a algo
 > persistente de verdad (ej. Supabase o Turso, ambos con plan gratuito).
-
-## Próximos pasos (Fase 3 — multi-camión)
-
-| Formato | Uso principal |
-|---|---|
-| CSV | Resumen de la ruta para oficina / reportes |
-| Google Maps (link) | Navegación rápida desde el celular, hasta ~10 paradas intermedias |
-| GeoJSON | Análisis en QGIS, ArcGIS, geojson.io, Felt |
-| Shapefile (.zip) | Capas de línea y puntos para SIG (QGIS/ArcGIS) |
-| GPX | Navegación GPS completa con voz (OsmAnd, Garmin) |
-| KML | Google Earth / Google My Maps |
-| Waze (links por parada) | Navegación turno por turno, parada por parada |
 
 ## Próximos pasos (Fase 4 — multi-camión)
 
