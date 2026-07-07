@@ -1,24 +1,29 @@
 # 🚚 Optimizador de Rutas de Recolección
 
 Calcula la ruta óptima de recolección con horarios estimados, peso por
-parada, mapa interactivo y exportación a CSV / Google Maps.
+parada, mapa interactivo y exportación a múltiples formatos (CSV, Google
+Maps, GeoJSON, Shapefile, GPX, KML, Waze).
 
-## Novedades de esta versión (Fase 1)
+## Novedades de esta versión (Fase 3)
 
-- **Persistencia con SQLite** (`rutas.db`): los puntos de recolección y la
-  configuración (hora de inicio, velocidad, capacidad, depot) ya no se
-  pierden al recargar la página.
-- **Errores de OSRM visibles**: si el servicio de rutas no responde, la app
-  te dice por qué (timeout, sin conexión, etc.) en vez de fallar en
-  silencio.
-- **Geocodificación opcional**: podés escribir una dirección en texto y la
-  app le busca las coordenadas (usa Nominatim/OpenStreetMap, gratis).
-- **Link directo a Google Maps**: además del CSV, podés abrir la ruta ya
-  ordenada directamente en Google Maps desde el celular.
+- **Exportación para SIG / GPS / navegación**, además del CSV y el link a
+  Google Maps de la fase anterior:
+  - **GeoJSON** — se abre directo en QGIS, ArcGIS, geojson.io, Felt, etc.
+  - **Shapefile (.zip)** — capas de línea (ruta) y puntos (paradas), listas
+    para QGIS o ArcGIS.
+  - **GPX** — para importar en OsmAnd, Garmin BaseCamp, Maps.me y apps de
+    navegación GPS en general.
+  - **KML** — para abrir en Google Earth o importar en Google My Maps.
+- **Integración con Waze**: como Waze no tiene API pública de multi-paradas,
+  se generan links individuales por parada (`waze.com/ul?...&navigate=yes`)
+  para que el chofer los abra uno por uno, con la alternativa recomendada de
+  importar el GPX en OsmAnd para navegación de ruta completa con voz.
+- Se mantiene todo lo de la Fase 2: persistencia en SQLite, geocodificación
+  de direcciones con Nominatim, y manejo visible de errores de OSRM.
 
 ## Instalación local
 
-```bash
+```
 pip install -r requirements.txt
 python -m streamlit run app.py
 ```
@@ -47,9 +52,28 @@ instalar nada:
 > inesperadamente, el siguiente paso sería mover la base de datos a algo
 > persistente de verdad (ej. Supabase o Turso, ambos con plan gratuito).
 
-## Próximos pasos (Fase 2 — multi-camión)
+## Formatos de exportación disponibles
 
-La tabla `puntos` en `db.py` ya incluye una columna `camion_asignado`
-(vacía por ahora), pensada para cuando se agregue optimización con
-múltiples vehículos — así no habrá que migrar datos cuando llegue ese
-momento.
+| Formato | Uso principal |
+|---|---|
+| CSV | Resumen de la ruta para oficina / reportes |
+| Google Maps (link) | Navegación rápida desde el celular, hasta ~10 paradas intermedias |
+| GeoJSON | Análisis en QGIS, ArcGIS, geojson.io, Felt |
+| Shapefile (.zip) | Capas de línea y puntos para SIG (QGIS/ArcGIS) |
+| GPX | Navegación GPS completa con voz (OsmAnd, Garmin) |
+| KML | Google Earth / Google My Maps |
+| Waze (links por parada) | Navegación turno por turno, parada por parada |
+
+## Próximos pasos (Fase 4 — multi-camión)
+
+La tabla `puntos` en `db.py` ya incluye una columna `camion_asignado` (vacía
+por ahora), pensada para cuando se agregue optimización con múltiples
+vehículos — así no habrá que migrar datos cuando llegue ese momento.
+
+Otras mejoras identificadas para más adelante:
+- Ventanas de tiempo por parada (clientes que solo reciben en cierto horario).
+- Caché de la matriz de distancias en SQLite para no recalcular contra OSRM
+  si los puntos no cambiaron.
+- Importar puntos desde Excel/CSV con `st.file_uploader`.
+- Servidor OSRM propio (Docker) en vez del endpoint público.
+- Historial de rutas calculadas (fecha, km totales, peso).

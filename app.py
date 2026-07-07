@@ -136,6 +136,156 @@ def resolver_vrp(distancias):
     return ruta
 
 
+
+def exportar_geojson(r):
+    import json
+    todas_coords = []
+    for seg in r["segmentos"]:
+        coords = [[lon, lat] for lat, lon in seg["camino"]]
+        if todas_coords and coords:
+            todas_coords.extend(coords[1:])
+        else:
+            todas_coords.extend(coords)
+
+    features = [{
+        "type": "Feature",
+        "geometry": {"type": "LineString", "coordinates": todas_coords},
+        "properties": {"nombre": "Ruta optima", "tipo": "ruta"},
+    }]
+    for i, node in enumerate(r["ruta_nodos"]):
+        lat, lon = r["LOCATIONS"][node]
+        res = r["resumen"][i]
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {
+                "orden": i,
+                "nombre": r["NOMBRES"][node],
+                "hora_llegada": res["Hora llegada"],
+                "peso_kg": res["Peso recogido (kg)"],
+                "peso_acumulado_kg": res["Peso acumulado (kg)"],
+                "distancia_tramo_km": res["Distancia tramo (km)"],
+                "tipo": "depot" if node == 0 else "parada",
+            },
+        })
+    return json.dumps({"type": "FeatureCollection", "features": features},
+                      ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def exportar_shapefile(r):
+    import io, zipfile, tempfile, os
+    import geopandas as gpd
+    from shapely.geometry import LineString, Point
+
+    todas_coords = []
+    for seg in r["segmentos"]:
+        coords = [(lon, lat) for lat, lon in seg["camino"]]
+        if todas_coords and coords:
+            todas_coords.extend(coords[1:])
+        else:
+            todas_coords.extend(coords)
+
+    gdf_linea = gpd.GeoDataFrame(
+        [{"nombre": "Ruta optima"}],
+        geometry=[LineString(todas_coords)],
+        crs="EPSG:4326",
+    )
+
+    rows = []
+    for i, node in enumerate(r["ruta_nodos"]):
+        lat, lon = r["LOCATIONS"][node]
+        res = r["resumen"][i]
+        peso = res["Peso recogido (kg)"]
+        rows.append({
+            "orden": i,
+            "nombre": r["NOMBRES"][node],
+            "hora": res["Hora llegada"],
+            "peso_kg": float(peso) if str(peso) not in ("", "-") else 0.0,
+            "tipo": "depot" if node == 0 else "parada",
+            "geometry": Point(lon, lat),
+        })
+    gdf_puntos = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+
+    # pyogrio (backend de geopandas) no soporta escritura a BytesIO en ESRI Shapefile,
+    # asi que se usa un directorio temporal y se empaqueta el resultado en un zip.
+    buf = io.BytesIO()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for nombre_capa, gdf in [("ruta_linea", gdf_linea), ("ruta_puntos", gdf_puntos)]:
+                capa_dir = os.path.join(tmpdir, nombre_capa)
+                os.makedirs(capa_dir)
+                path_shp = os.path.join(capa_dir, f"{nombre_capa}.shp")
+                gdf.to_file(path_shp, driver="ESRI Shapefile")
+                for fname in os.listdir(capa_dir):
+                    zf.write(os.path.join(capa_dir, fname), fname)
+    buf.seek(0)
+    return buf.read()
+
+
+def exportar_gpx(r):
+    from xml.etree.ElementTree import Element, SubElement, tostring
+    from xml.dom import minidom
+
+    gpx = Element("gpx", {
+        "version": "1.1", "creator": "Optimizador de Rutas",
+        "xmlns": "http://www.topografix.com/GPX/1/1",
+    })
+    for i, node in enumerate(r["ruta_nodos"]):
+        lat, lon = r["LOCATIONS"][node]
+        res = r["resumen"][i]
+        wpt = SubElement(gpx, "wpt", {"lat": str(lat), "lon": str(lon)})
+        SubElement(wpt, "name").text = r["NOMBRES"][node]
+        SubElement(wpt, "desc").text = (
+            f"Orden: {i} | Hora: {res['Hora llegada']} | Peso: {res['Peso recogido (kg)']} kg"
+        )
+    trk = SubElement(gpx, "trk")
+    SubElement(trk, "name").text = "Ruta optima"
+    trkseg = SubElement(trk, "trkseg")
+    for seg in r["segmentos"]:
+        for lat, lon in seg["camino"]:
+            SubElement(trkseg, "trkpt", {"lat": str(lat), "lon": str(lon)})
+    raw = tostring(gpx, encoding="unicode")
+    return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
+
+
+def exportar_kml(r):
+    from xml.etree.ElementTree import Element, SubElement, tostring
+    from xml.dom import minidom
+
+    kml = Element("kml", {"xmlns": "http://www.opengis.net/kml/2.2"})
+    doc = SubElement(kml, "Document")
+    SubElement(doc, "name").text = "Ruta optima de recoleccion"
+    style = SubElement(doc, "Style", {"id": "ruta"})
+    ls = SubElement(style, "LineStyle")
+    SubElement(ls, "color").text = "ff0000e7"
+    SubElement(ls, "width").text = "4"
+
+    for i, node in enumerate(r["ruta_nodos"]):
+        lat, lon = r["LOCATIONS"][node]
+        res = r["resumen"][i]
+        pm = SubElement(doc, "Placemark")
+        SubElement(pm, "name").text = r["NOMBRES"][node]
+        SubElement(pm, "description").text = (
+            f"Orden: {i} | Hora: {res['Hora llegada']} | Peso: {res['Peso recogido (kg)']} kg"
+        )
+        pt = SubElement(pm, "Point")
+        SubElement(pt, "coordinates").text = f"{lon},{lat},0"
+
+    pm_ruta = SubElement(doc, "Placemark")
+    SubElement(pm_ruta, "name").text = "Recorrido"
+    SubElement(pm_ruta, "styleUrl").text = "#ruta"
+    ls2 = SubElement(pm_ruta, "LineString")
+    SubElement(ls2, "tessellate").text = "1"
+    coords_str = " ".join(
+        f"{lon},{lat},0"
+        for seg in r["segmentos"]
+        for lat, lon in seg["camino"]
+    )
+    SubElement(ls2, "coordinates").text = coords_str
+    raw = tostring(kml, encoding="unicode")
+    return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
+
+
 def generar_link_google_maps(locations_in_order):
     """Genera un link de Google Maps con el origen, destino y paradas intermedias.
     Nota: Google Maps (sin API key) soporta hasta ~10 waypoints intermedios."""
@@ -434,15 +584,74 @@ if st.session_state.resultados:
 
     # Exportar
     st.subheader("⬇️ Exportar")
-    col_e1, col_e2 = st.columns(2)
 
+    orden_locations = [r["LOCATIONS"][n] for n in r["ruta_nodos"]]
+
+    # Fila 1: CSV + Google Maps
+    col_e1, col_e2 = st.columns(2)
     with col_e1:
         csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Descargar resumen CSV", csv, "ruta_optima.csv", "text/csv", use_container_width=True)
-
+        st.download_button("📥 CSV (resumen)", csv, "ruta_optima.csv", "text/csv",
+                           use_container_width=True)
     with col_e2:
-        orden_locations = [r["LOCATIONS"][n] for n in r["ruta_nodos"]]
         link_maps, demasiados_puntos = generar_link_google_maps(orden_locations)
-        st.link_button("🗺️ Abrir ruta en Google Maps", link_maps, use_container_width=True)
+        st.link_button("🗺️ Abrir en Google Maps", link_maps, use_container_width=True)
         if demasiados_puntos:
-            st.caption("⚠️ Hay más de 10 paradas intermedias: Google Maps solo abrirá las primeras 10 en el link.")
+            st.caption("⚠️ Mas de 10 paradas: Google Maps solo muestra las primeras 10.")
+
+    st.divider()
+    st.markdown("**Exportar para SIG / GPS / navegacion:**")
+
+    # Fila 2: GeoJSON + Shapefile
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        geojson_bytes = exportar_geojson(r)
+        st.download_button("🌐 GeoJSON (QGIS / ArcGIS / web)",
+                           geojson_bytes, "ruta_optima.geojson",
+                           "application/geo+json", use_container_width=True)
+        st.caption("Abre directo en QGIS, ArcGIS, geojson.io, Felt, etc.")
+    with col_g2:
+        shp_bytes = exportar_shapefile(r)
+        st.download_button("📦 Shapefile (.zip)",
+                           shp_bytes, "ruta_optima_shp.zip",
+                           "application/zip", use_container_width=True)
+        st.caption("Descomprimí el .zip y abrí el .shp en QGIS o ArcGIS.")
+
+    # Fila 3: GPX + KML
+    col_g3, col_g4 = st.columns(2)
+    with col_g3:
+        gpx_bytes = exportar_gpx(r)
+        st.download_button("📡 GPX (GPS / OsmAnd / Garmin)",
+                           gpx_bytes, "ruta_optima.gpx",
+                           "application/gpx+xml", use_container_width=True)
+        st.caption("Importa en OsmAnd, Maps.me, Garmin BaseCamp, etc.")
+    with col_g4:
+        kml_bytes = exportar_kml(r)
+        st.download_button("🌍 KML (Google Earth)",
+                           kml_bytes, "ruta_optima.kml",
+                           "application/vnd.google-earth.kml+xml", use_container_width=True)
+        st.caption("Abre en Google Earth o importa en Google My Maps.")
+
+    # Waze
+    with st.expander("Como usar con Waze"):
+        st.markdown("""
+Waze **no tiene API publica de multi-paradas** como Google Maps.
+Tenes dos opciones:
+
+**Opcion A - Parada por parada (desde el celular):**
+El chofer toca el link de la primera parada, llega, cierra Waze, toca el segundo, y asi.
+
+**Opcion B - Importar GPX en OsmAnd (recomendado):**
+Descarga el GPX de arriba e importalo en [OsmAnd](https://osmand.net/) (gratis, Android/iOS).
+OsmAnd navega rutas GPX completas con instruccion por voz, igual que Waze.
+""")
+        for i, node in enumerate(r["ruta_nodos"]):
+            if node == 0:
+                continue
+            lat, lon = r["LOCATIONS"][node]
+            nombre = r["NOMBRES"][node]
+            hora = r["resumen"][i]["Hora llegada"]
+            es_ultimo = (i == len(r["ruta_nodos"]) - 1)
+            if not es_ultimo:
+                waze_url = f"https://waze.com/ul?ll={lat},{lon}&navigate=yes"
+                st.markdown(f"**Parada {i} - {nombre}** ({hora}): [Abrir en Waze]({waze_url})")
