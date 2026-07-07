@@ -4,7 +4,7 @@ Calcula la ruta óptima de recolección con horarios estimados, peso por
 parada, mapa interactivo y exportación a múltiples formatos (CSV, Google
 Maps, GeoJSON, Shapefile, GPX, KML, Waze).
 
-## Novedades de esta versión (Fase 3)
+## Novedades de esta versión (Fase 2)
 
 - **Exportación para SIG / GPS / navegación**, además del CSV y el link a
   Google Maps de la fase anterior:
@@ -52,7 +52,7 @@ instalar nada:
 > inesperadamente, el siguiente paso sería mover la base de datos a algo
 > persistente de verdad (ej. Supabase o Turso, ambos con plan gratuito).
 
-## Formatos de exportación disponibles
+## Próximos pasos (Fase 3 — multi-camión)
 
 | Formato | Uso principal |
 |---|---|
