@@ -1,15 +1,23 @@
 """
-Panel Web - Optimizador de Rutas de Recolección
-================================================
+Panel Web - Optimizador de Rutas de Recolección — v5.1 (archivo único)
+=====================================================
+Novedades v5:
+- Multi-camión REAL: OR-Tools reparte los puntos entre camiones respetando
+  la capacidad individual de cada uno (AddDimensionWithVehicleCapacity).
+- Capacidad por camión (ej: Camión 1 = 5000 kg, Camión 2 = 15000 kg).
+- Asignación manual opcional: columna "Camión" en la tabla de puntos
+  ("Auto" deja que el optimizador decida).
+- Pestaña de Costos: comparación modelo actual (costo por tonelada)
+  vs modelo nuevo (combustible por km + otros costos).
+- Interfaz reorganizada en pestañas para reducir la saturación visual.
+
+TODO EN UN SOLO ARCHIVO: ya no se necesita db.py (si existe, se ignora;
+podés borrarlo). La base de datos rutas.db se sigue usando igual.
+
 Instalación:
-    pip install ortools folium requests streamlit streamlit-folium pandas
-
-Correr localmente:
+    pip install -r requirements.txt
+Correr:
     python -m streamlit run app.py
-
-Los datos (puntos y configuración) se guardan automáticamente en rutas.db
-(SQLite) en la misma carpeta, así que no se pierden al recargar la página
-ni al cerrar la terminal.
 """
 
 import math
@@ -17,23 +25,258 @@ import time
 from datetime import datetime, timedelta
 
 import folium
+from folium.plugins import Fullscreen
 import pandas as pd
 import requests
 import streamlit as st
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 from streamlit_folium import st_folium
 
-import db
 
-st.set_page_config(page_title="Optimizador de Rutas", page_icon="🚚", layout="wide")
-st.title("🚚 Optimizador de Rutas de Recolección")
-st.markdown("Calcula la ruta óptima con horarios estimados y peso por parada.")
+
+# ═════════════════════════════════════════════
+# BASE DE DATOS (integrada — antes era db.py)
+# ═════════════════════════════════════════════
+import sqlite3
+from contextlib import contextmanager
+
+DB_PATH = "rutas.db"
+
+DB_TO_UI = {
+    "nombre": "Nombre",
+    "direccion": "Dirección",
+    "latitud": "Latitud",
+    "longitud": "Longitud",
+    "peso_kg": "Peso (kg)",
+    "camion_asignado": "Camión",
+}
+UI_TO_DB = {v: k for k, v in DB_TO_UI.items()}
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS puntos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL,
+                direccion TEXT,
+                latitud REAL,
+                longitud REAL,
+                peso_kg REAL DEFAULT 0,
+                camion_asignado TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                clave TEXT PRIMARY KEY,
+                valor TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS camiones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL,
+                capacidad_kg REAL DEFAULT 1000
+            )
+        """)
+
+
+# ── Puntos ────────────────────────────────────────────────────────────────
+def hay_puntos_guardados():
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM puntos").fetchone()[0] > 0
+
+
+def cargar_puntos():
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT nombre, direccion, latitud, longitud, peso_kg, camion_asignado "
+            "FROM puntos ORDER BY id",
+            conn,
+        )
+    df = df.rename(columns=DB_TO_UI)
+    df["Camión"] = df["Camión"].fillna("Auto")
+    return df
+
+
+def guardar_puntos(df_ui):
+    df = df_ui.rename(columns=UI_TO_DB).copy()
+    for col in ["nombre", "direccion", "latitud", "longitud", "peso_kg", "camion_asignado"]:
+        if col not in df.columns:
+            df[col] = None
+    df = df[["nombre", "direccion", "latitud", "longitud", "peso_kg", "camion_asignado"]]
+    df = df.dropna(subset=["nombre"])
+    with get_conn() as conn:
+        conn.execute("DELETE FROM puntos")
+        if len(df) > 0:
+            df.to_sql("puntos", conn, if_exists="append", index=False)
+
+
+# ── Camiones ──────────────────────────────────────────────────────────────
+def hay_camiones_guardados():
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM camiones").fetchone()[0] > 0
+
+
+def cargar_camiones():
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT nombre, capacidad_kg FROM camiones ORDER BY id", conn
+        )
+    return df.rename(columns={"nombre": "Nombre", "capacidad_kg": "Capacidad (kg)"})
+
+
+def guardar_camiones(df_ui):
+    df = df_ui.rename(columns={"Nombre": "nombre", "Capacidad (kg)": "capacidad_kg"}).copy()
+    df = df.dropna(subset=["nombre"])
+    with get_conn() as conn:
+        conn.execute("DELETE FROM camiones")
+        if len(df) > 0:
+            df[["nombre", "capacidad_kg"]].to_sql("camiones", conn, if_exists="append", index=False)
+
+
+# ── Config ────────────────────────────────────────────────────────────────
+def obtener_config(clave, default=None):
+    with get_conn() as conn:
+        row = conn.execute("SELECT valor FROM config WHERE clave = ?", (clave,)).fetchone()
+        return row[0] if row is not None else default
+
+
+def guardar_config(clave, valor):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO config (clave, valor) VALUES (?, ?)
+               ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor""",
+            (clave, str(valor)),
+        )
+
+
+def guardar_configuracion_general(**kwargs):
+    with get_conn() as conn:
+        for clave, valor in kwargs.items():
+            conn.execute(
+                """INSERT INTO config (clave, valor) VALUES (?, ?)
+                   ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor""",
+                (clave, str(valor)),
+            )
+
+
+class _DB:
+    """Espacio de nombres para mantener las llamadas db.xxx() del resto del código."""
+    pass
+
+
+db = _DB()
+for _f in (init_db, hay_puntos_guardados, cargar_puntos, guardar_puntos,
+           hay_camiones_guardados, cargar_camiones, guardar_camiones,
+           obtener_config, guardar_config, guardar_configuracion_general):
+    setattr(db, _f.__name__, _f)
+
+
+st.set_page_config(page_title="Optimizador de Rutas", layout="wide")
+st.markdown("""
+<style>
+footer {visibility: hidden;}
+
+/* Tipografía base más grande y legible */
+html, body, [data-testid="stAppViewContainer"] {font-size: 17px;}
+h1 {font-size: 2.1rem; font-weight: 700; letter-spacing: -0.01em;}
+h2 {font-size: 1.5rem; font-weight: 650;}
+h3 {font-size: 1.25rem; font-weight: 600;}
+p, li, label {font-size: 1.02rem;}
+[data-testid="stCaptionContainer"] {font-size: 0.95rem;}
+
+/* Pestañas grandes y visibles (selectores para todas las versiones de Streamlit) */
+.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p,
+.stTabs [data-baseweb="tab"] p,
+.stTabs [data-baseweb="tab"] {
+    font-size: 1.5rem !important;
+    font-weight: 700 !important;
+}
+.stTabs [data-baseweb="tab-list"] button {
+    padding: 1.0rem 2.0rem !important;
+    height: auto !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0.6rem;
+    position: sticky; top: 0; z-index: 999;
+    background: white;
+    border-bottom: 2px solid #E5EAF2;
+    padding-top: 0.3rem;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    background-color: #2563EB; height: 4px;
+}
+.stTabs [aria-selected="true"] {
+    background: #EFF4FF; border-radius: 8px 8px 0 0;
+}
+
+/* Botones claros, con borde definido y buen tamaño */
+.stButton button, .stDownloadButton button, .stLinkButton a {
+    font-size: 1.05rem !important;
+    padding: 0.6rem 1.1rem !important;
+    border-radius: 8px !important;
+    border: 1.5px solid #C7D2E5 !important;
+}
+.stDownloadButton button, .stLinkButton a {
+    background: #F7F9FC !important;
+}
+.stButton button:hover, .stDownloadButton button:hover, .stLinkButton a:hover {
+    border-color: #2563EB !important;
+    color: #2563EB !important;
+}
+
+/* Métricas grandes */
+[data-testid="stMetricValue"] {font-size: 1.7rem; font-weight: 650;}
+[data-testid="stMetricLabel"] {font-size: 1.0rem; color: #4B5563;}
+
+/* Expandibles con borde claro */
+div[data-testid="stExpander"] {
+    border: 1.5px solid #D6DEEA; border-radius: 8px;
+}
+div[data-testid="stExpander"] summary,
+div[data-testid="stExpander"] summary p,
+div[data-testid="stExpander"] summary [data-testid="stMarkdownContainer"] p {
+    font-size: 1.25rem !important; font-weight: 650 !important;
+}
+
+/* Tablas de detalle grandes y legibles */
+[data-testid="stTable"] table {font-size: 1.05rem;}
+[data-testid="stTable"] th {
+    font-size: 1.0rem; font-weight: 650;
+    background: #F4F6FA;
+}
+[data-testid="stTable"] td, [data-testid="stTable"] th {
+    padding: 0.55rem 0.8rem !important;
+}
+
+/* Inputs un poco más altos */
+input {font-size: 1.02rem !important;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Optimizador de Rutas de Recolección")
+st.caption("Planificación de rutas multi-camión con restricciones de capacidad, "
+           "análisis de costos y exportación a formatos GIS.")
 
 db.init_db()
 
+# Colores por camión (mapa y KML)
+COLORES = ["#E74C3C", "#2980B9", "#27AE60", "#8E44AD", "#F39C12", "#16A085", "#D35400", "#7F8C8D"]
+COLORES_KML = ["ff3c4ce7", "ffb98029", "ff60ae27", "ffad448e", "ff12c9f3", "ff85a016", "ff0054d3", "ff8d8c7f"]
 
 # ─────────────────────────────────────────────
-# FUNCIONES (definidas antes de la UI que las usa)
+# FUNCIONES
 # ─────────────────────────────────────────────
 def haversine(c1, c2):
     R = 6_371_000
@@ -44,7 +287,6 @@ def haversine(c1, c2):
 
 
 def geocodificar_direccion(direccion):
-    """Convierte una dirección de texto en (lat, lon) usando Nominatim (OpenStreetMap)."""
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": direccion, "format": "json", "limit": 1}
     headers = {"User-Agent": "optimizador-rutas-app/1.0"}
@@ -67,7 +309,7 @@ def obtener_matriz_osrm(locations):
     coords_str = ";".join(f"{lon},{lat}" for lat, lon in locations)
     url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=distance"
     try:
-        resp = requests.get(url, timeout=20)
+        resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == "Ok":
@@ -79,77 +321,114 @@ def obtener_matriz_osrm(locations):
         error_msg = "No se pudo conectar con OSRM (revisá tu conexión a internet)."
     except Exception as e:
         error_msg = f"Error inesperado consultando OSRM: {e}"
-
     n = len(locations)
     matriz = [[0 if i == j else haversine(locations[i], locations[j]) for j in range(n)] for i in range(n)]
     return matriz, False, error_msg
 
 
-def obtener_ruta_osrm(origen, destino):
-    url = (
-        f"http://router.project-osrm.org/route/v1/driving/"
-        f"{origen[1]},{origen[0]};{destino[1]},{destino[0]}"
-        f"?overview=full&geometries=geojson"
-    )
+def obtener_ruta_completa_osrm(stops):
+    """
+    UNA sola llamada OSRM para todo el recorrido de un camión (multi-waypoint).
+    Devuelve (camino, dist_legs_m, error):
+    - camino: lista (lat, lon) con la geometría completa por carretera
+    - dist_legs_m: distancia en metros de cada tramo parada-a-parada
+    """
+    if len(stops) < 2:
+        return list(stops), [], None
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in stops)
+    url = (f"http://router.project-osrm.org/route/v1/driving/{coords_str}"
+           f"?overview=full&geometries=geojson")
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == "Ok":
-            coords = data["routes"][0]["geometry"]["coordinates"]
-            dist_m = data["routes"][0]["legs"][0]["distance"]
-            return [(lat, lon) for lon, lat in coords], dist_m, None
-        return [origen, destino], haversine(origen, destino), f"OSRM código '{data.get('code')}'"
+            ruta = data["routes"][0]
+            camino = [(lat, lon) for lon, lat in ruta["geometry"]["coordinates"]]
+            dist_legs = [leg["distance"] for leg in ruta["legs"]]
+            return camino, dist_legs, None
+        err = f"OSRM código '{data.get('code')}'"
     except requests.exceptions.Timeout:
-        return [origen, destino], haversine(origen, destino), "timeout"
+        err = "timeout"
     except requests.exceptions.ConnectionError:
-        return [origen, destino], haversine(origen, destino), "sin conexión"
+        err = "sin conexión"
     except Exception as e:
-        return [origen, destino], haversine(origen, destino), f"error inesperado ({e})"
+        err = f"error inesperado ({e})"
+    # Fallback: línea recta entre paradas
+    camino = list(stops)
+    dist_legs = [haversine(stops[i], stops[i + 1]) for i in range(len(stops) - 1)]
+    return camino, dist_legs, err
 
 
-def resolver_vrp_multi(distancias, pesos, num_vehicles, capacidad_por_vehiculo):
-    """Reparte los puntos entre `num_vehicles` camiones respetando la capacidad
-    REAL de cada uno como restricción dura: si un camión se llenaría, el/los
-    puntos restantes se asignan a otro camión con espacio disponible.
-    Si ni sumando toda la flota alcanza la capacidad, esos puntos se descartan
-    (con una penalización alta para que el solver los deje de último recurso)
-    y se devuelven aparte para poder avisarle al usuario.
-    Devuelve (rutas, puntos_no_asignados)."""
-    manager = pywrapcp.RoutingIndexManager(len(distancias), num_vehicles, 0)
+def resolver_vrp(distancias, demandas, capacidades, asignaciones=None, balancear=False, end_node=None):
+    """
+    VRP multi-vehículo con restricción de capacidad POR CAMIÓN.
+
+    - distancias: matriz NxN en metros (nodo 0 = depot)
+    - demandas: peso en kg de cada nodo (demandas[0] = 0)
+    - capacidades: lista con la capacidad en kg de cada camión
+    - asignaciones: dict {nodo: índice_camión} para fijar manualmente
+    - balancear: si True, penaliza que un camión recorra mucho más que otro
+      (fuerza a repartir aunque todo quepa en un solo camión)
+
+    Devuelve lista de rutas, una por camión: [[0, 3, 1, 0], [0, 2, 4, 0], ...]
+    Un camión sin paradas devuelve [0, 0].
+    """
+    n_vehiculos = len(capacidades)
+    if end_node is None:
+        # Salida y llegada en el mismo depot (nodo 0)
+        manager = pywrapcp.RoutingIndexManager(len(distancias), n_vehiculos, 0)
+    else:
+        # Depot de salida (nodo 0) distinto al de llegada (end_node)
+        manager = pywrapcp.RoutingIndexManager(
+            len(distancias), n_vehiculos,
+            [0] * n_vehiculos, [end_node] * n_vehiculos,
+        )
     routing = pywrapcp.RoutingModel(manager)
 
-    def dist_cb(from_idx, to_idx):
+    def cb_dist(from_idx, to_idx):
         return distancias[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
 
-    transit_idx = routing.RegisterTransitCallback(dist_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+    t = routing.RegisterTransitCallback(cb_dist)
+    routing.SetArcCostEvaluatorOfAllVehicles(t)
 
-    def demand_cb(from_idx):
-        return int(pesos[manager.IndexToNode(from_idx)])
+    # ── Restricción de capacidad (la clave del reparto entre camiones) ──
+    def cb_demanda(from_idx):
+        return int(demandas[manager.IndexToNode(from_idx)])
 
-    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    d = routing.RegisterUnaryTransitCallback(cb_demanda)
     routing.AddDimensionWithVehicleCapacity(
-        demand_idx, 0, [int(capacidad_por_vehiculo)] * num_vehicles, True, "Carga"
+        d,
+        0,                                   # sin holgura
+        [int(c) for c in capacidades],       # capacidad individual por camión
+        True,                                # el acumulado arranca en 0
+        "Capacidad",
     )
 
-    # Penalización alta por punto descartado: el solver solo lo hace si de
-    # verdad no hay forma de que ningún camión lo cubra sin pasarse de peso.
-    penalizacion = sum(sum(fila) for fila in distancias) + 1
-    for node in range(1, len(distancias)):
-        routing.AddDisjunction([manager.NodeToIndex(node)], penalizacion)
+    # ── Asignación manual de puntos a camiones ──
+    if asignaciones:
+        for nodo, veh in asignaciones.items():
+            index = manager.NodeToIndex(nodo)
+            routing.VehicleVar(index).SetValues([veh])
+
+    # ── Balanceo opcional de rutas ──
+    if balancear:
+        routing.AddDimension(t, 0, 3_000_000, True, "Distancia")
+        dist_dim = routing.GetDimensionOrDie("Distancia")
+        dist_dim.SetGlobalSpanCostCoefficient(100)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.seconds = 10
+    n_nodos = len(distancias)
+    params.time_limit.seconds = max(10, min(60, n_nodos * 2))
 
     sol = routing.SolveWithParameters(params)
     if not sol:
-        return None, []
+        return None
 
     rutas = []
-    for v in range(num_vehicles):
+    for v in range(n_vehiculos):
         idx = routing.Start(v)
         ruta = []
         while not routing.IsEnd(idx):
@@ -157,713 +436,800 @@ def resolver_vrp_multi(distancias, pesos, num_vehicles, capacidad_por_vehiculo):
             idx = sol.Value(routing.NextVar(idx))
         ruta.append(manager.IndexToNode(idx))
         rutas.append(ruta)
-
-    visitados = {n for ruta in rutas for n in ruta}
-    no_asignados = [n for n in range(1, len(distancias)) if n not in visitados]
-    return rutas, no_asignados
+    return rutas
 
 
-def construir_resultado_camion(ruta_base, LOCATIONS, NOMBRES, PESOS,
-                                capacidad_max, hora_inicio_dt, velocidad_kmh, tiempo_parada):
-    """Recorre la ruta de un camión en una sola pasada (sin vueltas a mitad de
-    ruta) y arma distancias reales, horarios y pesos. Si el peso total asignado
-    supera la capacidad del camión, se marca como advertencia (no se corta la ruta)."""
-    DEPOT_IDX = 0
-    advertencias = []
-    ultimo_idx = len(ruta_base) - 1
-
-    segmentos = []
-    resumen = []
-    hora_actual = hora_inicio_dt
-    peso_acumulado = 0
-
-    for i, node in enumerate(ruta_base):
-        if i > 0:
-            origen = LOCATIONS[ruta_base[i - 1]]
-            destino = LOCATIONS[node]
-            camino, dist_m, _ = obtener_ruta_osrm(origen, destino)
-            segmentos.append({"camino": camino, "dist_m": dist_m})
-            hora_actual += timedelta(hours=(dist_m / 1000) / velocidad_kmh)
-            dist_tramo = f"{dist_m / 1000:.2f}"
-        else:
-            dist_tramo = "-"
-
-        if node == DEPOT_IDX:
-            parada_label = "🏠 Inicio (Depot)" if i == 0 else "🏠 Fin (Depot)"
-            resumen.append({
-                "Parada": parada_label,
-                "Nombre": NOMBRES[node],
-                "Hora llegada": hora_actual.strftime("%H:%M"),
-                "Peso recogido (kg)": 0,
-                "Peso acumulado (kg)": 0 if i == 0 else peso_acumulado,
-                "Distancia tramo (km)": dist_tramo,
-            })
-        else:
-            peso_nodo = PESOS[node]
-            peso_acumulado += peso_nodo
-            resumen.append({
-                "Parada": f"📦 Parada {i}",
-                "Nombre": NOMBRES[node],
-                "Hora llegada": hora_actual.strftime("%H:%M"),
-                "Peso recogido (kg)": peso_nodo,
-                "Peso acumulado (kg)": peso_acumulado,
-                "Distancia tramo (km)": dist_tramo,
-            })
-            hora_actual += timedelta(minutes=tiempo_parada)
-
-    if peso_acumulado > capacidad_max:
-        advertencias.append(
-            f"⚠️ El peso total asignado a este camión ({peso_acumulado:.0f} kg) "
-            f"supera su capacidad ({capacidad_max} kg)."
-        )
-
-    return {
-        "ruta_nodos": ruta_base,
-        "segmentos": segmentos,
-        "resumen": resumen,
-        "hora_fin": hora_actual.strftime("%H:%M"),
-        "peso_total_dia": peso_acumulado,
-        "dist_total_km": sum(s["dist_m"] for s in segmentos) / 1000,
-        "advertencias": advertencias,
-    }
+def generar_links_google_maps(locations_in_order):
+    """Divide la ruta en segmentos de máx. 10 puntos (límite de Google Maps sin API)."""
+    CHUNK = 9
+    links = []
+    puntos = locations_in_order
+    i = 0
+    seg_num = 1
+    while i < len(puntos) - 1:
+        chunk = puntos[i: i + CHUNK + 2]
+        if len(chunk) < 2:
+            break
+        origin, destination = chunk[0], chunk[-1]
+        waypoints = chunk[1:-1]
+        url = ("https://www.google.com/maps/dir/?api=1"
+               f"&origin={origin[0]},{origin[1]}"
+               f"&destination={destination[0]},{destination[1]}")
+        if waypoints:
+            url += "&waypoints=" + "|".join(f"{lat},{lon}" for lat, lon in waypoints)
+        url += "&travelmode=driving"
+        es_ultimo = (i + CHUNK + 1 >= len(puntos) - 1)
+        links.append((f"Segmento {seg_num}" + (" (final)" if es_ultimo else ""), url))
+        i += CHUNK + 1
+        seg_num += 1
+    return links
 
 
-
-def exportar_geojson(r):
+# ─────────────────────────────────────────────
+# EXPORTADORES (multi-camión)
+# ─────────────────────────────────────────────
+def exportar_geojson(res):
     import json
-    todas_coords = []
-    for seg in r["segmentos"]:
-        coords = [[lon, lat] for lat, lon in seg["camino"]]
-        if todas_coords and coords:
-            todas_coords.extend(coords[1:])
-        else:
-            todas_coords.extend(coords)
-
-    features = [{
-        "type": "Feature",
-        "geometry": {"type": "LineString", "coordinates": todas_coords},
-        "properties": {"nombre": "Ruta optima", "tipo": "ruta"},
-    }]
-    for i, node in enumerate(r["ruta_nodos"]):
-        lat, lon = r["LOCATIONS"][node]
-        res = r["resumen"][i]
+    features = []
+    for c in res["camiones"]:
         features.append({
             "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [lon, lat]},
-            "properties": {
-                "orden": i,
-                "nombre": r["NOMBRES"][node],
-                "hora_llegada": res["Hora llegada"],
-                "peso_kg": res["Peso recogido (kg)"],
-                "peso_acumulado_kg": res["Peso acumulado (kg)"],
-                "distancia_tramo_km": res["Distancia tramo (km)"],
-                "tipo": "depot" if node == 0 else "parada",
-            },
+            "geometry": {"type": "LineString",
+                         "coordinates": [[lon, lat] for lat, lon in c["camino"]]},
+            "properties": {"camion": c["nombre"], "tipo": "ruta",
+                           "distancia_km": round(c["dist_total_m"] / 1000, 2)},
         })
+        for fila in c["resumen"]:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point",
+                             "coordinates": [fila["lon"], fila["lat"]]},
+                "properties": {
+                    "camion": c["nombre"], "orden": fila["orden"],
+                    "nombre": fila["Nombre"], "hora_llegada": fila["Hora llegada"],
+                    "peso_kg": fila["Peso recogido (kg)"],
+                    "tipo": "depot" if str(fila["Nombre"]).startswith("DEPOT") else "parada",
+                },
+            })
     return json.dumps({"type": "FeatureCollection", "features": features},
                       ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def exportar_shapefile(r):
+def exportar_shapefile(res):
     import io, zipfile, tempfile, os
     import geopandas as gpd
     from shapely.geometry import LineString, Point
 
-    todas_coords = []
-    for seg in r["segmentos"]:
-        coords = [(lon, lat) for lat, lon in seg["camino"]]
-        if todas_coords and coords:
-            todas_coords.extend(coords[1:])
-        else:
-            todas_coords.extend(coords)
+    lineas, puntos = [], []
+    for c in res["camiones"]:
+        lineas.append({"camion": c["nombre"],
+                       "dist_km": round(c["dist_total_m"] / 1000, 2),
+                       "geometry": LineString([(lon, lat) for lat, lon in c["camino"]])})
+        for fila in c["resumen"]:
+            peso = fila["Peso recogido (kg)"]
+            puntos.append({"camion": c["nombre"], "orden": fila["orden"],
+                           "nombre": fila["Nombre"], "hora": fila["Hora llegada"],
+                           "peso_kg": float(peso) if str(peso) not in ("", "-") else 0.0,
+                           "geometry": Point(fila["lon"], fila["lat"])})
 
-    gdf_linea = gpd.GeoDataFrame(
-        [{"nombre": "Ruta optima"}],
-        geometry=[LineString(todas_coords)],
-        crs="EPSG:4326",
-    )
+    gdf_lineas = gpd.GeoDataFrame(lineas, crs="EPSG:4326")
+    gdf_puntos = gpd.GeoDataFrame(puntos, crs="EPSG:4326")
 
-    rows = []
-    for i, node in enumerate(r["ruta_nodos"]):
-        lat, lon = r["LOCATIONS"][node]
-        res = r["resumen"][i]
-        peso = res["Peso recogido (kg)"]
-        rows.append({
-            "orden": i,
-            "nombre": r["NOMBRES"][node],
-            "hora": res["Hora llegada"],
-            "peso_kg": float(peso) if str(peso) not in ("", "-") else 0.0,
-            "tipo": "depot" if node == 0 else "parada",
-            "geometry": Point(lon, lat),
-        })
-    gdf_puntos = gpd.GeoDataFrame(rows, crs="EPSG:4326")
-
-    # pyogrio (backend de geopandas) no soporta escritura a BytesIO en ESRI Shapefile,
-    # asi que se usa un directorio temporal y se empaqueta el resultado en un zip.
     buf = io.BytesIO()
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for nombre_capa, gdf in [("ruta_linea", gdf_linea), ("ruta_puntos", gdf_puntos)]:
+            for nombre_capa, gdf in [("rutas_lineas", gdf_lineas), ("rutas_puntos", gdf_puntos)]:
                 capa_dir = os.path.join(tmpdir, nombre_capa)
                 os.makedirs(capa_dir)
-                path_shp = os.path.join(capa_dir, f"{nombre_capa}.shp")
-                gdf.to_file(path_shp, driver="ESRI Shapefile")
+                gdf.to_file(os.path.join(capa_dir, f"{nombre_capa}.shp"), driver="ESRI Shapefile")
                 for fname in os.listdir(capa_dir):
                     zf.write(os.path.join(capa_dir, fname), fname)
     buf.seek(0)
     return buf.read()
 
 
-def exportar_gpx(r):
+def exportar_gpx(res):
     from xml.etree.ElementTree import Element, SubElement, tostring
     from xml.dom import minidom
-
-    gpx = Element("gpx", {
-        "version": "1.1", "creator": "Optimizador de Rutas",
-        "xmlns": "http://www.topografix.com/GPX/1/1",
-    })
-    for i, node in enumerate(r["ruta_nodos"]):
-        lat, lon = r["LOCATIONS"][node]
-        res = r["resumen"][i]
-        wpt = SubElement(gpx, "wpt", {"lat": str(lat), "lon": str(lon)})
-        SubElement(wpt, "name").text = r["NOMBRES"][node]
-        SubElement(wpt, "desc").text = (
-            f"Orden: {i} | Hora: {res['Hora llegada']} | Peso: {res['Peso recogido (kg)']} kg"
-        )
-    trk = SubElement(gpx, "trk")
-    SubElement(trk, "name").text = "Ruta optima"
-    trkseg = SubElement(trk, "trkseg")
-    for seg in r["segmentos"]:
-        for lat, lon in seg["camino"]:
+    gpx = Element("gpx", {"version": "1.1", "creator": "Optimizador de Rutas",
+                          "xmlns": "http://www.topografix.com/GPX/1/1"})
+    for c in res["camiones"]:
+        for fila in c["resumen"]:
+            wpt = SubElement(gpx, "wpt", {"lat": str(fila["lat"]), "lon": str(fila["lon"])})
+            SubElement(wpt, "name").text = f"[{c['nombre']}] {fila['Nombre']}"
+            SubElement(wpt, "desc").text = (f"Orden: {fila['orden']} | Hora: {fila['Hora llegada']} | "
+                                            f"Peso: {fila['Peso recogido (kg)']} kg")
+        trk = SubElement(gpx, "trk")
+        SubElement(trk, "name").text = f"Ruta {c['nombre']}"
+        trkseg = SubElement(trk, "trkseg")
+        for lat, lon in c["camino"]:
             SubElement(trkseg, "trkpt", {"lat": str(lat), "lon": str(lon)})
     raw = tostring(gpx, encoding="unicode")
     return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
 
 
-def exportar_kml(r):
+def exportar_kml(res):
     from xml.etree.ElementTree import Element, SubElement, tostring
     from xml.dom import minidom
-
     kml = Element("kml", {"xmlns": "http://www.opengis.net/kml/2.2"})
     doc = SubElement(kml, "Document")
-    SubElement(doc, "name").text = "Ruta optima de recoleccion"
-    style = SubElement(doc, "Style", {"id": "ruta"})
-    ls = SubElement(style, "LineStyle")
-    SubElement(ls, "color").text = "ff0000e7"
-    SubElement(ls, "width").text = "4"
-
-    for i, node in enumerate(r["ruta_nodos"]):
-        lat, lon = r["LOCATIONS"][node]
-        res = r["resumen"][i]
-        pm = SubElement(doc, "Placemark")
-        SubElement(pm, "name").text = r["NOMBRES"][node]
-        SubElement(pm, "description").text = (
-            f"Orden: {i} | Hora: {res['Hora llegada']} | Peso: {res['Peso recogido (kg)']} kg"
-        )
-        pt = SubElement(pm, "Point")
-        SubElement(pt, "coordinates").text = f"{lon},{lat},0"
-
-    pm_ruta = SubElement(doc, "Placemark")
-    SubElement(pm_ruta, "name").text = "Recorrido"
-    SubElement(pm_ruta, "styleUrl").text = "#ruta"
-    ls2 = SubElement(pm_ruta, "LineString")
-    SubElement(ls2, "tessellate").text = "1"
-    coords_str = " ".join(
-        f"{lon},{lat},0"
-        for seg in r["segmentos"]
-        for lat, lon in seg["camino"]
-    )
-    SubElement(ls2, "coordinates").text = coords_str
+    SubElement(doc, "name").text = "Rutas de recolección"
+    for i in range(len(COLORES_KML)):
+        style = SubElement(doc, "Style", {"id": f"ruta{i}"})
+        ls = SubElement(style, "LineStyle")
+        SubElement(ls, "color").text = COLORES_KML[i]
+        SubElement(ls, "width").text = "4"
+    for vi, c in enumerate(res["camiones"]):
+        folder = SubElement(doc, "Folder")
+        SubElement(folder, "name").text = c["nombre"]
+        for fila in c["resumen"]:
+            pm = SubElement(folder, "Placemark")
+            SubElement(pm, "name").text = fila["Nombre"]
+            SubElement(pm, "description").text = (
+                f"{c['nombre']} | Orden: {fila['orden']} | Hora: {fila['Hora llegada']} | "
+                f"Peso: {fila['Peso recogido (kg)']} kg")
+            pt = SubElement(pm, "Point")
+            SubElement(pt, "coordinates").text = f"{fila['lon']},{fila['lat']},0"
+        pm_ruta = SubElement(folder, "Placemark")
+        SubElement(pm_ruta, "name").text = f"Recorrido {c['nombre']}"
+        SubElement(pm_ruta, "styleUrl").text = f"#ruta{vi % len(COLORES_KML)}"
+        ls2 = SubElement(pm_ruta, "LineString")
+        SubElement(ls2, "tessellate").text = "1"
+        SubElement(ls2, "coordinates").text = " ".join(
+            f"{lon},{lat},0" for lat, lon in c["camino"])
     raw = tostring(kml, encoding="unicode")
     return minidom.parseString(raw).toprettyxml(indent="  ", encoding="utf-8")
 
 
-def generar_link_google_maps(locations_in_order):
-    """Genera un link de Google Maps con el origen, destino y paradas intermedias.
-    Nota: Google Maps (sin API key) soporta hasta ~10 waypoints intermedios."""
-    origin = locations_in_order[0]
-    destination = locations_in_order[-1]
-    waypoints = locations_in_order[1:-1]
-
-    url = (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&origin={origin[0]},{origin[1]}"
-        f"&destination={destination[0]},{destination[1]}"
-    )
-    if waypoints:
-        wp_str = "|".join(f"{lat},{lon}" for lat, lon in waypoints[:10])
-        url += f"&waypoints={wp_str}"
-    url += "&travelmode=driving"
-    return url, len(waypoints) > 10
-
-
 # ─────────────────────────────────────────────
-# SESSION STATE
+# SESSION STATE Y DATOS INICIALES
 # ─────────────────────────────────────────────
 if "resultados" not in st.session_state:
     st.session_state.resultados = None
 
-DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-
-
-def dias_de_frecuencia(frecuencia):
-    """Convierte el texto libre de 'Días de recolección' en un set de días válidos.
-    Acepta: 'Todos los días', 'Lunes a Sábado', o una lista separada por comas
-    con cualquier combinación de días (ej. 'Lunes, Jueves')."""
-    if frecuencia is None:
-        return set(DIAS_SEMANA)
-    texto = str(frecuencia).strip()
-    if texto == "" or texto.lower() == "todos los días":
-        return set(DIAS_SEMANA)
-    if texto == "Lunes a Sábado":
-        return set(DIAS_SEMANA) - {"Domingo"}
-    return {p.strip() for p in texto.split(",") if p.strip()}
-
-
-def punto_aplica(frecuencia, dias_seleccionados):
-    """True si el punto (según su frecuencia) recolecta en alguno de los días seleccionados."""
-    return bool(dias_de_frecuencia(frecuencia) & set(dias_seleccionados))
-
-
-# Datos por defecto solo se usan si la base de datos está vacía (primera vez)
-datos_default = pd.DataFrame({
-    "Nombre":     ["Punto 1", "Punto 2", "Punto 3", "Punto 4", "Punto 5", "Punto 6"],
-    "Dirección":  ["", "", "", "", "", ""],
-    "Latitud":    [9.934804, 9.936133, 9.931150, 9.979572, 10.016073, 9.996015],
-    "Longitud":   [-84.081784, -84.082634, -84.093640, -84.152163, -84.215665, -84.118091],
-    "Peso (kg)":  [50, 80, 120, 60, 90, 110],
-    "Días de recolección": ["Todos los días"] * 6,
+datos_default_puntos = pd.DataFrame({
+    "Nombre":    ["Punto 1", "Punto 2", "Punto 3", "Punto 4", "Punto 5", "Punto 6"],
+    "Dirección": ["", "", "", "", "", ""],
+    "Latitud":   [9.934804, 9.936133, 9.931150, 9.979572, 10.016073, 9.996015],
+    "Longitud":  [-84.081784, -84.082634, -84.093640, -84.152163, -84.215665, -84.118091],
+    "Peso (kg)": [50, 80, 120, 60, 90, 110],
+    "Camión":    ["Auto"] * 6,
+})
+datos_default_camiones = pd.DataFrame({
+    "Nombre": ["Camión 1"],
+    "Capacidad (kg)": [1000.0],
 })
 
-
-
 if db.hay_puntos_guardados():
-    datos_iniciales = db.cargar_puntos()
+    datos_puntos = db.cargar_puntos()
 else:
-    datos_iniciales = datos_default
-    db.guardar_puntos(datos_default)
+    datos_puntos = datos_default_puntos
+    db.guardar_puntos(datos_default_puntos)
 
-# Fallback defensivo: si la base de datos es de una versión anterior a esta
-# columna y por algún motivo no se migró, se agrega acá para no romper la app.
-if "Días de recolección" not in datos_iniciales.columns:
-    datos_iniciales["Días de recolección"] = "Todos los días"
+if db.hay_camiones_guardados():
+    datos_camiones = db.cargar_camiones()
+else:
+    datos_camiones = datos_default_camiones
+    db.guardar_camiones(datos_default_camiones)
 
 # ─────────────────────────────────────────────
-# SIDEBAR — configuración (con valores guardados como default)
+# SIDEBAR — configuración general
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuración")
-
-    hora_inicio_str = st.text_input(
-        "🕗 Hora de inicio (HH:MM)",
-        value=db.obtener_config("hora_inicio", "08:00"),
-    )
+    hora_inicio_str = st.text_input("Hora de inicio (HH:MM)",
+                                    value=db.obtener_config("hora_inicio", "08:00"))
     try:
         hora_inicio = datetime.strptime(hora_inicio_str, "%H:%M").time()
     except ValueError:
-        st.warning("Formato de hora inválido, usando 08:00.")
+        st.warning("Formato inválido, usando 08:00.")
         hora_inicio = datetime.strptime("08:00", "%H:%M").time()
 
-    velocidad_kmh = st.number_input(
-        "🚗 Velocidad promedio (km/h)", min_value=10, max_value=120,
-        value=int(db.obtener_config("velocidad_kmh", 40)),
+    velocidad_kmh = st.number_input("Velocidad promedio (km/h)", 10, 120,
+                                    value=int(db.obtener_config("velocidad_kmh", 40)))
+    tiempo_parada = st.number_input("Tiempo por parada (min)", 1, 60,
+                                    value=int(db.obtener_config("tiempo_parada", 10)))
+    balancear = st.checkbox(
+        "Balancear rutas entre camiones",
+        value=db.obtener_config("balancear", "0") == "1",
+        help="Si está activo, reparte las paradas entre todos los camiones aunque "
+             "el peso quepa en uno solo. Si está inactivo, usa la menor cantidad "
+             "de camiones posible (menor distancia total).",
     )
-    tiempo_parada = st.number_input(
-        "⏱️ Tiempo por parada (min)", min_value=1, max_value=60,
-        value=int(db.obtener_config("tiempo_parada", 10)),
-    )
-    capacidad_max = st.number_input(
-        "📦 Capacidad por camión (kg)", min_value=1,
-        value=int(float(db.obtener_config("capacidad_max", 1000))),
-    )
-
     st.divider()
-    st.header("🚛 Flota")
-    num_camiones = st.number_input(
-        "Número de camiones disponibles", min_value=1, max_value=20,
-        value=int(db.obtener_config("num_camiones", 1)),
-    )
-    st.caption(
-        "Los puntos se reparten entre los camiones disponibles balanceando por peso."
-    )
+    st.header("📍 Depot de salida")
+    depot_lat = st.number_input("Latitud", value=float(db.obtener_config("depot_lat", 9.964356)), format="%.6f")
+    depot_lon = st.number_input("Longitud", value=float(db.obtener_config("depot_lon", -84.161528)), format="%.6f")
 
-    st.divider()
-    st.header("📍 Depot (Bodega)")
-    depot_lat = st.number_input(
-        "Latitud", value=float(db.obtener_config("depot_lat", 9.964356)), format="%.6f",
+    depot_distinto = st.checkbox(
+        "El depot de llegada es distinto",
+        value=db.obtener_config("depot_distinto", "0") == "1",
+        help="Activalo si los camiones terminan la jornada en un lugar "
+             "diferente al de salida (otra bodega, plantel, relleno, etc.).",
     )
-    depot_lon = st.number_input(
-        "Longitud", value=float(db.obtener_config("depot_lon", -84.161528)), format="%.6f",
-    )
-
-    if st.button("💾 Guardar configuración", use_container_width=True):
-        db.guardar_configuracion_general(
-            hora_inicio=hora_inicio_str,
-            velocidad_kmh=velocidad_kmh,
-            tiempo_parada=tiempo_parada,
-            capacidad_max=capacidad_max,
-            num_camiones=num_camiones,
-            depot_lat=depot_lat,
-            depot_lon=depot_lon,
+    if depot_distinto:
+        st.header("🏁 Depot de llegada (fijo)")
+        st.caption("El punto de llegada es fijo y no cambia entre rutas. "
+                   "Solo el de salida se ajusta día a día.")
+        editar_llegada = st.checkbox(
+            "Desbloquear para corregir", value=False,
+            help="Activar únicamente si hay que corregir las coordenadas "
+                 "del punto de llegada. Recordá guardar después.",
         )
-        st.success("Configuración guardada ✅")
-
-
-# ─────────────────────────────────────────────
-# TABLA DE PUNTOS
-# ─────────────────────────────────────────────
-st.subheader("📋 Puntos de Recolección")
-st.caption(
-    "💡 Podés llenar la columna **Dirección** y usar el botón de geocodificación "
-    "en vez de escribir Latitud/Longitud a mano."
-)
-
-tabla = st.data_editor(
-    datos_iniciales,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "Latitud":   st.column_config.NumberColumn(format="%.6f"),
-        "Longitud":  st.column_config.NumberColumn(format="%.6f"),
-        "Peso (kg)": st.column_config.NumberColumn(min_value=0),
-        "Dirección": st.column_config.TextColumn(width="large"),
-        "Días de recolección": st.column_config.TextColumn(
-            width="medium",
-            help=(
-                "'Todos los días', 'Lunes a Sábado', o cualquier combinación separada "
-                "por comas, ej: 'Lunes, Jueves' o 'Martes, Viernes, Domingo'."
-            ),
-        ),
-    },
-    key="editor_puntos",
-)
-
-col_g1, col_g2, col_g3 = st.columns([1, 1, 2])
-with col_g1:
-    if st.button("📍 Completar coordenadas desde dirección"):
-        pendientes = tabla[
-            tabla["Dirección"].fillna("").str.strip().ne("")
-            & (tabla["Latitud"].isna() | tabla["Longitud"].isna())
-        ]
-        if len(pendientes) == 0:
-            st.info("No hay direcciones pendientes de geocodificar.")
-        else:
-            with st.spinner(f"Geocodificando {len(pendientes)} dirección(es)..."):
-                errores_geo = []
-                for idx in pendientes.index:
-                    direccion = tabla.loc[idx, "Dirección"]
-                    lat, lon, err = geocodificar_direccion(direccion)
-                    if lat is not None:
-                        tabla.loc[idx, "Latitud"] = lat
-                        tabla.loc[idx, "Longitud"] = lon
-                    else:
-                        errores_geo.append(f"{direccion}: {err}")
-                    time.sleep(1)  # respetar límite de 1 req/seg de Nominatim
-                db.guardar_puntos(tabla)
-                if errores_geo:
-                    st.warning("No se pudieron geocodificar:\n" + "\n".join(errores_geo))
-                else:
-                    st.success("Coordenadas completadas ✅")
-                st.rerun()
-
-with col_g2:
-    if st.button("💾 Guardar puntos"):
-        db.guardar_puntos(tabla)
-        st.success("Puntos guardados ✅")
-
-# ─────────────────────────────────────────────
-# DÍA(S) A CALCULAR
-# ─────────────────────────────────────────────
-st.subheader("📅 Día(s) a calcular")
-hoy_idx = datetime.today().weekday()  # 0 = Lunes ... 6 = Domingo
-dias_calculo = st.multiselect(
-    "Solo se incluirán en la ruta los puntos programados para alguno de estos días",
-    options=DIAS_SEMANA, default=[DIAS_SEMANA[hoy_idx]],
-)
-
-# ─────────────────────────────────────────────
-# BOTÓN CALCULAR
-# ─────────────────────────────────────────────
-if st.button("🔍 Calcular Ruta Óptima", type="primary", use_container_width=True):
-    if not dias_calculo:
-        st.error("Elegí al menos un día para calcular la ruta.")
-        st.stop()
-
-    db.guardar_puntos(tabla)  # guardar antes de calcular, por si se cierra la app
-    puntos_validos = tabla.dropna(subset=["Latitud", "Longitud"])
-    if "Días de recolección" in puntos_validos.columns:
-        col_frecuencia = puntos_validos["Días de recolección"]
+        depot2_lat = st.number_input(
+            "Latitud (llegada)",
+            value=float(db.obtener_config("depot2_lat", 9.964356)),
+            format="%.6f", disabled=not editar_llegada)
+        depot2_lon = st.number_input(
+            "Longitud (llegada)",
+            value=float(db.obtener_config("depot2_lon", -84.161528)),
+            format="%.6f", disabled=not editar_llegada)
     else:
-        col_frecuencia = pd.Series("Todos los días", index=puntos_validos.index)
-    puntos = puntos_validos[col_frecuencia.apply(lambda f: punto_aplica(f, dias_calculo))]
+        depot2_lat, depot2_lon = depot_lat, depot_lon
 
-    dias_texto = ", ".join(dias_calculo)
-    if len(puntos) < 2:
-        st.error(
-            f"Necesitas al menos 2 puntos programados para **{dias_texto}** con coordenadas válidas "
-            f"(hay {len(puntos)}). Revisá la columna 'Días de recolección' de la tabla."
+    if st.button("Guardar configuración", use_container_width=True):
+        db.guardar_configuracion_general(
+            hora_inicio=hora_inicio_str, velocidad_kmh=velocidad_kmh,
+            tiempo_parada=tiempo_parada, balancear="1" if balancear else "0",
+            depot_lat=depot_lat, depot_lon=depot_lon,
+            depot_distinto="1" if depot_distinto else "0",
+            depot2_lat=depot2_lat, depot2_lon=depot2_lon,
         )
+        st.success("Guardada")
+
+# ─────────────────────────────────────────────
+# PESTAÑAS
+# ─────────────────────────────────────────────
+tab_puntos, tab_camiones, tab_resultados, tab_costos, tab_exportar = st.tabs(
+    ["📋 Puntos", "🚛 Camiones", "🗺️ Resultados", "💰 Costos", "📤 Exportar"]
+)
+
+# ══════════════ TAB CAMIONES ══════════════
+with tab_camiones:
+    st.subheader("🚛 Flota de camiones")
+    st.caption("Agregá una fila por camión. Cada uno puede tener capacidad distinta.")
+    tabla_camiones = st.data_editor(
+        datos_camiones, num_rows="dynamic", use_container_width=True,
+        column_config={
+            "Capacidad (kg)": st.column_config.NumberColumn(min_value=1, format="%.0f"),
+        },
+        key="editor_camiones",
+    )
+    if st.button("Guardar camiones"):
+        db.guardar_camiones(tabla_camiones)
+        st.success("Camiones guardados (recargá para ver los nombres en la tabla de puntos)")
+
+    cams_validos = tabla_camiones.dropna(subset=["Nombre", "Capacidad (kg)"])
+    if len(cams_validos) > 0:
+        cap_total = cams_validos["Capacidad (kg)"].sum()
+        st.metric("Capacidad total de la flota", f"{cap_total:,.0f} kg")
+
+nombres_camiones = tabla_camiones.dropna(subset=["Nombre"])["Nombre"].tolist()
+
+# ══════════════ TAB PUNTOS ══════════════
+with tab_puntos:
+    st.subheader("📋 Puntos de Recolección")
+    st.caption('Columna **Camión**: "Auto" deja que el optimizador decida; '
+               "elegí un camión específico para forzar que ese punto vaya con él.")
+    tabla = st.data_editor(
+        datos_puntos, num_rows="dynamic", use_container_width=True,
+        column_config={
+            "Latitud":   st.column_config.NumberColumn(format="%.6f"),
+            "Longitud":  st.column_config.NumberColumn(format="%.6f"),
+            "Peso (kg)": st.column_config.NumberColumn(min_value=0),
+            "Dirección": st.column_config.TextColumn(width="large"),
+            "Camión":    st.column_config.SelectboxColumn(
+                options=["Auto"] + nombres_camiones, default="Auto"),
+        },
+        key="editor_puntos",
+    )
+
+    peso_total_puntos = tabla["Peso (kg)"].fillna(0).sum()
+    cap_flota = tabla_camiones.dropna(subset=["Capacidad (kg)"])["Capacidad (kg)"].sum()
+    c1, c2 = st.columns(2)
+    c1.metric("Peso total a recolectar", f"{peso_total_puntos:,.0f} kg")
+    if peso_total_puntos > cap_flota:
+        c2.error(f"Excede la capacidad de la flota ({cap_flota:,.0f} kg). "
+                 "Agregá camiones o capacidad antes de calcular.")
+    else:
+        c2.success(f"Dentro de la capacidad de la flota ({cap_flota:,.0f} kg)")
+
+    col_b1, col_b2, _ = st.columns([1, 1, 2])
+    with col_b1:
+        if st.button("Geocodificar direcciones"):
+            pendientes = tabla[
+                tabla["Dirección"].fillna("").str.strip().ne("")
+                & (tabla["Latitud"].isna() | tabla["Longitud"].isna())
+            ]
+            if len(pendientes) == 0:
+                st.info("No hay direcciones pendientes.")
+            else:
+                with st.spinner(f"Geocodificando {len(pendientes)}..."):
+                    errores_geo = []
+                    for idx in pendientes.index:
+                        direccion = tabla.loc[idx, "Dirección"]
+                        lat, lon, err = geocodificar_direccion(direccion)
+                        if lat is not None:
+                            tabla.loc[idx, "Latitud"] = lat
+                            tabla.loc[idx, "Longitud"] = lon
+                        else:
+                            errores_geo.append(f"{direccion}: {err}")
+                        time.sleep(1)
+                    db.guardar_puntos(tabla)
+                    if errores_geo:
+                        st.warning("No se pudieron geocodificar:\n" + "\n".join(errores_geo))
+                    st.rerun()
+    with col_b2:
+        if st.button("Guardar puntos"):
+            db.guardar_puntos(tabla)
+            st.success("Guardados")
+
+# ══════════════ CÁLCULO (botón siempre visible bajo las pestañas) ══════════════
+st.divider()
+if st.button("🔍 Calcular Rutas Óptimas", type="primary", use_container_width=True):
+    db.guardar_puntos(tabla)
+    db.guardar_camiones(tabla_camiones)
+
+    puntos = tabla.dropna(subset=["Latitud", "Longitud"])
+    cams = tabla_camiones.dropna(subset=["Nombre", "Capacidad (kg)"])
+
+    if len(puntos) < 1:
+        st.error("Necesitás al menos 1 punto con coordenadas.")
+        st.stop()
+    if len(cams) < 1:
+        st.error("Necesitás al menos 1 camión (pestaña Camiones).")
         st.stop()
 
     DEPOT = (depot_lat, depot_lon)
     LOCATIONS = [DEPOT] + list(zip(puntos["Latitud"], puntos["Longitud"]))
     NOMBRES = ["DEPOT"] + puntos["Nombre"].tolist()
-    # Peso: cualquier celda vacía/NaN se trata como 0 kg, no como "nan".
-    pesos_validos = pd.to_numeric(puntos["Peso (kg)"], errors="coerce").fillna(0)
-    PESOS = [0] + pesos_validos.tolist()
+    PESOS = [0] + puntos["Peso (kg)"].fillna(0).tolist()
 
-    with st.spinner("📡 Consultando OSRM y optimizando rutas..."):
+    end_node = None
+    if depot_distinto:
+        LOCATIONS.append((depot2_lat, depot2_lon))
+        NOMBRES[0] = "DEPOT SALIDA"
+        NOMBRES.append("DEPOT LLEGADA")
+        PESOS.append(0)
+        end_node = len(LOCATIONS) - 1
+    CAPACIDADES = cams["Capacidad (kg)"].tolist()
+    NOMBRES_CAM = cams["Nombre"].tolist()
+
+    if sum(PESOS) > sum(CAPACIDADES):
+        st.error(f"El peso total ({sum(PESOS):,.0f} kg) excede la capacidad de la "
+                 f"flota ({sum(CAPACIDADES):,.0f} kg). Agregá camiones o capacidad.")
+        st.stop()
+
+    # Asignaciones manuales: nodo → índice de camión
+    asignaciones = {}
+    camion_col = puntos["Camión"].fillna("Auto").tolist()
+    for i, cam_nombre in enumerate(camion_col):
+        if cam_nombre != "Auto" and cam_nombre in NOMBRES_CAM:
+            asignaciones[i + 1] = NOMBRES_CAM.index(cam_nombre)  # +1 por el depot
+
+    with st.spinner("Consultando OSRM y optimizando rutas..."):
         distancias, uso_osrm, error_matriz = obtener_matriz_osrm(LOCATIONS)
+        rutas = resolver_vrp(distancias, PESOS, CAPACIDADES,
+                             asignaciones=asignaciones or None, balancear=balancear,
+                             end_node=end_node)
 
-        # La capacidad real de cada camión es una restricción dura: si un
-        # camión se llenaría, el/los puntos que sobran se asignan a otro
-        # camión con espacio disponible.
-        resultado_solver = resolver_vrp_multi(distancias, PESOS, num_camiones, capacidad_max)
-
-        if resultado_solver is None or resultado_solver[0] is None:
-            st.error(
-                "No se encontró solución. Probá aumentar la capacidad por camión, "
-                "sumar más camiones, o revisar los puntos cargados."
-            )
+        if rutas is None:
+            st.error("No se encontró solución. Posibles causas: asignaciones manuales "
+                     "imposibles de cumplir con las capacidades, o capacidad insuficiente.")
             st.stop()
 
-        rutas_base, no_asignados = resultado_solver
+        camiones_res = []
+        errores_osrm = []
+        for v, ruta_nodos in enumerate(rutas):
+            if len(ruta_nodos) <= 2:
+                continue  # camión sin paradas
+            stops = [LOCATIONS[n] for n in ruta_nodos]
+            camino, dist_legs, err = obtener_ruta_completa_osrm(stops)
+            if err:
+                errores_osrm.append(f"{NOMBRES_CAM[v]}: {err}")
 
-        hora_inicio_dt = datetime.combine(datetime.today(), hora_inicio)
-        camiones_resultado = []
-        for idx_camion, ruta_base in enumerate(rutas_base):
-            if len(ruta_base) <= 2:
-                continue  # camión sin puntos asignados
-            resultado = construir_resultado_camion(
-                ruta_base, LOCATIONS, NOMBRES, PESOS,
-                capacidad_max, hora_inicio_dt, velocidad_kmh, tiempo_parada,
-            )
-            resultado["camion"] = idx_camion + 1
-            camiones_resultado.append(resultado)
+            hora_actual = datetime.combine(datetime.today(), hora_inicio)
+            peso_acum = 0
+            resumen = []
+            for i, node in enumerate(ruta_nodos):
+                lat, lon = LOCATIONS[node]
+                if i == 0:
+                    resumen.append({
+                        "orden": 0, "lat": lat, "lon": lon,
+                        "Parada": "Inicio (Depot)", "Nombre": NOMBRES[node],
+                        "Hora llegada": hora_actual.strftime("%H:%M"),
+                        "Peso recogido (kg)": 0, "Peso acumulado (kg)": 0,
+                        "Distancia tramo (km)": "-",
+                    })
+                else:
+                    dist_m = dist_legs[i - 1]
+                    hora_actual += timedelta(hours=(dist_m / 1000) / velocidad_kmh)
+                    es_ultimo = (i == len(ruta_nodos) - 1)
+                    peso_p = PESOS[node] if not es_ultimo else 0
+                    peso_acum += peso_p
+                    resumen.append({
+                        "orden": i, "lat": lat, "lon": lon,
+                        "Parada": "Fin (Depot)" if es_ultimo else f"Parada {i}",
+                        "Nombre": NOMBRES[node],
+                        "Hora llegada": hora_actual.strftime("%H:%M"),
+                        "Peso recogido (kg)": peso_p,
+                        "Peso acumulado (kg)": peso_acum,
+                        "Distancia tramo (km)": f"{dist_m / 1000:.2f}",
+                    })
+                    if not es_ultimo:
+                        hora_actual += timedelta(minutes=tiempo_parada)
 
-        if not camiones_resultado:
-            st.error("Ningún camión quedó con puntos asignados. Revisá la configuración.")
-            st.stop()
+            camiones_res.append({
+                "nombre": NOMBRES_CAM[v],
+                "capacidad": CAPACIDADES[v],
+                "vehiculo_idx": v,
+                "ruta_nodos": ruta_nodos,
+                "camino": camino,
+                "dist_legs_m": dist_legs,
+                "dist_total_m": sum(dist_legs),
+                "resumen": resumen,
+                "peso_total": peso_acum,
+                "hora_fin": hora_actual.strftime("%H:%M"),
+            })
 
         st.session_state.resultados = {
+            "camiones": camiones_res,
             "uso_osrm": uso_osrm,
             "error_matriz": error_matriz,
-            "camiones": camiones_resultado,
-            "puntos_sin_asignar": [NOMBRES[n] for n in no_asignados],
-            "LOCATIONS": LOCATIONS,
-            "NOMBRES": NOMBRES,
-            "PESOS": PESOS,
-            "dia_calculo": dias_texto,
-            "puntos_excluidos_hoy": len(puntos_validos) - len(puntos),
+            "errores_osrm": errores_osrm,
+            "hora_inicio": hora_inicio.strftime("%H:%M"),
         }
+    st.success(f"Rutas calculadas para {len(camiones_res)} camión(es). "
+               "Mirá la pestaña Resultados.")
 
-# ─────────────────────────────────────────────
-# MOSTRAR RESULTADOS
-# ─────────────────────────────────────────────
-if st.session_state.resultados:
-    r = st.session_state.resultados
-    camiones = r["camiones"]
-
-    st.subheader(f"📅 Ruta para: {r['dia_calculo']}")
-    if r["puntos_excluidos_hoy"] > 0:
-        st.caption(
-            f"ℹ️ {r['puntos_excluidos_hoy']} punto(s) no están programados para "
-            f"{r['dia_calculo']} y no se incluyeron en esta ruta."
-        )
-
-    if r["uso_osrm"]:
-        st.success("✅ Rutas calculadas con distancias reales por carretera (OSRM)")
+# ══════════════ TAB RESULTADOS ══════════════
+with tab_resultados:
+    if not st.session_state.resultados:
+        st.info("Todavía no hay rutas calculadas. Cargá puntos y camiones y presioná "
+                "**Calcular Rutas Óptimas**.")
     else:
-        st.warning(f"⚠️ Sin distancias reales de OSRM — usando línea recta. Motivo: {r['error_matriz']}")
+        r = st.session_state.resultados
+        if r["uso_osrm"]:
+            st.success("Distancias reales por carretera (OSRM)")
+        else:
+            st.warning(f"Usando línea recta. Motivo: {r['error_matriz']}")
+        if r["errores_osrm"]:
+            st.info("Tramos con línea recta por fallas puntuales: " + "; ".join(r["errores_osrm"]))
 
-    todas_advertencias = [a for c in camiones for a in c["advertencias"]]
-    for adv in todas_advertencias:
-        st.warning(adv)
+        dist_total = sum(c["dist_total_m"] for c in r["camiones"]) / 1000
+        peso_total = sum(c["peso_total"] for c in r["camiones"])
+        hora_fin_max = max(c["hora_fin"] for c in r["camiones"])
 
-    if r["puntos_sin_asignar"]:
-        nombres_sin_asignar = ", ".join(r["puntos_sin_asignar"])
-        st.error(
-            f"⚠️ Estos puntos no pudieron asignarse a ningún camión porque la flota no da abasto "
-            f"(ni sumando la capacidad de todos los camiones): **{nombres_sin_asignar}**. "
-            f"Sumá más camiones o aumentá la capacidad por camión para cubrirlos."
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Camiones usados", len(r["camiones"]))
+        m2.metric("Distancia total", f"{dist_total:.1f} km")
+        m3.metric("Peso total", f"{peso_total:,.0f} kg")
+        m4.metric("Fin estimado (último camión)", hora_fin_max)
+
+        # Mapa combinado con un color por camión
+        st.subheader("🗺️ Mapa de rutas")
+        all_lats = [lat for c in r["camiones"] for lat, lon in c["camino"]]
+        all_lons = [lon for c in r["camiones"] for lat, lon in c["camino"]]
+        centro = (sum(all_lats) / len(all_lats), sum(all_lons) / len(all_lons))
+        m = folium.Map(location=centro, zoom_start=12, tiles=None)
+        folium.TileLayer("OpenStreetMap", name="Mapa estándar").add_to(m)
+        folium.TileLayer(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/"
+            "MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery", name="Satélite",
+        ).add_to(m)
+        folium.TileLayer("CartoDB positron", name="Claro").add_to(m)
+        folium.TileLayer("CartoDB dark_matter", name="Oscuro").add_to(m)
+
+        for vi, c in enumerate(r["camiones"]):
+            color = COLORES[c["vehiculo_idx"] % len(COLORES)]
+            folium.PolyLine(c["camino"], color=color, weight=4, opacity=0.85,
+                            tooltip=c["nombre"]).add_to(m)
+            for fila in c["resumen"][:-1]:
+                if fila["orden"] == 0:
+                    depot_html = (
+                        '<div style="font-family:Segoe UI,Arial,sans-serif;'
+                        'font-size:15px;font-weight:700;white-space:nowrap;'
+                        'padding:4px 8px;">DEPOT — Inicio y fin de rutas</div>'
+                    )
+                    folium.Marker(
+                        [fila["lat"], fila["lon"]],
+                        popup=folium.Popup(depot_html, max_width=280),
+                        tooltip="DEPOT",
+                        icon=folium.Icon(color="red", icon="home"),
+                    ).add_to(m)
+                else:
+                    icon_html = (f'<div style="background:{color};color:white;border-radius:50%;'
+                                 f'width:32px;height:32px;display:flex;align-items:center;'
+                                 f'justify-content:center;font-size:14px;font-weight:bold;'
+                                 f'border:2px solid white;box-shadow:2px 2px 4px rgba(0,0,0,0.4);">'
+                                 f'{fila["orden"]}</div>')
+                    popup_html = (
+                        f'<div style="font-family:Segoe UI,Arial,sans-serif;'
+                        f'font-size:14px;line-height:1.7;white-space:nowrap;'
+                        f'padding:4px 6px;min-width:190px;">'
+                        f'<div style="font-size:16px;font-weight:700;'
+                        f'border-bottom:2.5px solid {color};'
+                        f'padding-bottom:5px;margin-bottom:7px;">'
+                        f'{fila["Nombre"]}</div>'
+                        f'<table style="border-collapse:collapse;font-size:14px;">'
+                        f'<tr><td style="color:#6B7280;padding-right:12px;">Camión</td>'
+                        f'<td style="font-weight:600;">{c["nombre"]}</td></tr>'
+                        f'<tr><td style="color:#6B7280;padding-right:12px;">Llegada</td>'
+                        f'<td style="font-weight:600;">{fila["Hora llegada"]}</td></tr>'
+                        f'<tr><td style="color:#6B7280;padding-right:12px;">Peso</td>'
+                        f'<td style="font-weight:600;">{fila["Peso recogido (kg)"]:g} kg</td></tr>'
+                        f'</table></div>'
+                    )
+                    folium.Marker(
+                        [fila["lat"], fila["lon"]],
+                        popup=folium.Popup(popup_html, max_width=320),
+                        tooltip=f"{c['nombre']} · {fila['orden']}. {fila['Nombre']}",
+                        icon=folium.DivIcon(html=icon_html, icon_size=(32, 32), icon_anchor=(16, 16)),
+                    ).add_to(m)
+        # Marcador del depot de llegada (si es distinto al de salida)
+        ultima = r["camiones"][0]["resumen"][-1] if r["camiones"] else None
+        if ultima is not None and ultima["Nombre"] == "DEPOT LLEGADA":
+            llegada_html = (
+                '<div style="font-family:Segoe UI,Arial,sans-serif;'
+                'font-size:15px;font-weight:700;white-space:nowrap;'
+                'padding:4px 8px;">DEPOT LLEGADA — Fin de rutas</div>'
+            )
+            folium.Marker(
+                [ultima["lat"], ultima["lon"]],
+                popup=folium.Popup(llegada_html, max_width=280),
+                tooltip="DEPOT LLEGADA",
+                icon=folium.Icon(color="green", icon="flag"),
+            ).add_to(m)
+
+        Fullscreen(position="topright", title="Pantalla completa",
+                   title_cancel="Salir de pantalla completa").add_to(m)
+        folium.LayerControl(position="topright", collapsed=True).add_to(m)
+        st_folium(m, use_container_width=True, height=760, returned_objects=[])
+
+        # Detalle por camión
+        st.subheader("Detalle por camión")
+        for vi, c in enumerate(r["camiones"]):
+            color = COLORES[c["vehiculo_idx"] % len(COLORES)]
+            uso_pct = c["peso_total"] / c["capacidad"] * 100 if c["capacidad"] else 0
+            with st.expander(
+                f"{c['nombre']}   |   {len(c['resumen']) - 2} paradas   |   "
+                f"{c['dist_total_m'] / 1000:.1f} km   |   carga {uso_pct:.0f}%",
+                expanded=(len(r["camiones"]) == 1),
+            ):
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Paradas", len(c["resumen"]) - 2)
+                e2.metric("Distancia", f"{c['dist_total_m'] / 1000:.1f} km")
+                e3.metric("Carga", f"{c['peso_total']:,.0f} kg",
+                          delta=f"{uso_pct:.0f}% de {c['capacidad']:,.0f} kg",
+                          delta_color="off")
+                e4.metric("Hora de fin", c["hora_fin"])
+
+                df_c = pd.DataFrame(c["resumen"]).drop(columns=["lat", "lon", "orden"])
+                for col_peso in ["Peso recogido (kg)", "Peso acumulado (kg)"]:
+                    df_c[col_peso] = df_c[col_peso].map(lambda v: f"{float(v):,.0f}")
+                st.table(df_c.style.hide(axis="index"))
+
+# ══════════════ TAB COSTOS ══════════════
+with tab_costos:
+    st.subheader("💰 Comparación de modelos de ruta")
+    st.caption("Compare el costo de la recolección bajo el modelo actual contra "
+               "el modelo nuevo (rutas optimizadas). Cada modelo tiene sus propias "
+               "toneladas y su propio precio por tonelada.")
+
+    toneladas_ruta = None
+    if st.session_state.resultados:
+        toneladas_ruta = sum(
+            c["peso_total"] for c in st.session_state.resultados["camiones"]
+        ) / 1000
+
+    col_actual, col_nuevo = st.columns(2)
+    with col_actual:
+        st.markdown("##### Modelo actual")
+        ton_actual_bruta = st.number_input(
+            "Toneladas recolectadas — modelo actual (total histórico)",
+            min_value=0.0, step=0.5, format="%.2f",
+            value=float(db.obtener_config("ton_actual", 0)),
+            help="Total de toneladas que maneja hoy el modelo actual, "
+                 "antes de restar lo que absorbe el proyecto nuevo.",
+        )
+        precio_actual = st.number_input(
+            "Precio por tonelada (CRC) — modelo actual",
+            min_value=0.0, step=1000.0, format="%.2f",
+            value=float(db.obtener_config("precio_ton_actual", 0)),
+        )
+    with col_nuevo:
+        st.markdown("##### Modelo nuevo (rutas optimizadas)")
+        ton_nuevo = st.number_input(
+            "Toneladas recolectadas — modelo nuevo",
+            min_value=0.0, step=0.5, format="%.2f",
+            value=float(toneladas_ruta) if toneladas_ruta is not None
+                  else float(db.obtener_config("ton_nuevo", 0)),
+            help="Se pre-llena con el peso total de las rutas calculadas. "
+                 "Puede modificarse para evaluar otros escenarios.",
+        )
+        if toneladas_ruta is not None and abs(ton_nuevo - toneladas_ruta) > 0.001:
+            st.caption(f"Las rutas calculadas suman {toneladas_ruta:.2f} ton.")
+        precio_nuevo = st.number_input(
+            "Precio por tonelada (CRC) — modelo nuevo",
+            min_value=0.0, step=1000.0, format="%.2f",
+            value=float(db.obtener_config("precio_ton_nuevo", 0)),
         )
 
-    # ── Resumen general (todos los camiones) ──
-    st.subheader("📊 Resumen general")
-    dist_total_general = sum(c["dist_total_km"] for c in camiones)
-    peso_total_general = sum(c["peso_total_dia"] for c in camiones)
-    hora_fin_general = max(c["hora_fin"] for c in camiones)
+    if st.button("Guardar parámetros de comparación"):
+        db.guardar_configuracion_general(
+            ton_actual=ton_actual_bruta, precio_ton_actual=precio_actual,
+            ton_nuevo=ton_nuevo, precio_ton_nuevo=precio_nuevo,
+        )
+        st.success("Parámetros guardados.")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("🚛 Camiones usados", f"{len(camiones)} / {num_camiones}")
-    col2.metric("📏 Distancia total", f"{dist_total_general:.1f} km")
-    col3.metric("📦 Peso total recolectado", f"{peso_total_general:.0f} kg")
-    col4.metric("🕐 Hora fin (último camión)", hora_fin_general)
+    # Las toneladas que ahora recoge el modelo nuevo dejan de estar
+    # disponibles para el modelo actual — se restan del total histórico.
+    ton_actual_neta = max(ton_actual_bruta - ton_nuevo, 0.0)
 
-    # ── Mapa con todas las rutas ──
-    st.subheader("🗺️ Mapa de todas las rutas")
-    todos_lats = [r["LOCATIONS"][n][0] for c in camiones for n in c["ruta_nodos"]]
-    todos_lons = [r["LOCATIONS"][n][1] for c in camiones for n in c["ruta_nodos"]]
-    centro = (sum(todos_lats) / len(todos_lats), sum(todos_lons) / len(todos_lons))
-
-    m = folium.Map(location=centro, zoom_start=12, tiles="OpenStreetMap", control_scale=True)
-
-    folium.TileLayer("OpenStreetMap", name="🗺️ Calles").add_to(m)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="🛰️ Satélite",
-    ).add_to(m)
-    folium.TileLayer("CartoDB dark_matter", name="🌙 Modo oscuro").add_to(m)
-
-    from folium.plugins import Fullscreen, MiniMap, Geocoder
-
-    Fullscreen(position="topleft", title="Pantalla completa", title_cancel="Salir").add_to(m)
-    MiniMap(toggle_display=True, position="bottomleft").add_to(m)
-    Geocoder(position="topright", collapsed=True).add_to(m)
-
-    PALETA = ["#E74C3C", "#2980B9", "#27AE60", "#F39C12", "#8E44AD",
-              "#16A085", "#D35400", "#2C3E50", "#C0392B", "#7F8C8D"]
-
-    # Depot: un solo marcador, se comparte entre todos los camiones
-    depot_lat_m, depot_lon_m = r["LOCATIONS"][0]
-    folium.Marker(
-        location=[depot_lat_m, depot_lon_m],
-        popup="🏠 DEPOT — Inicio/Fin",
-        tooltip="DEPOT",
-        icon=folium.Icon(color="red", icon="home"),
-    ).add_to(m)
-
-    for c in camiones:
-        color = PALETA[(c["camion"] - 1) % len(PALETA)]
-        grupo = folium.FeatureGroup(name=f"🚛 Camión {c['camion']}")
-
-        for seg in c["segmentos"]:
-            folium.PolyLine(seg["camino"], color=color, weight=4, opacity=0.85).add_to(grupo)
-
-        for i, node in enumerate(c["ruta_nodos"]):
-            if node == 0:
-                continue  # el depósito (inicio/fin/descargas) ya tiene su propio marcador
-            lat, lon = r["LOCATIONS"][node]
-            hora_parada = c["resumen"][i]["Hora llegada"]
-            peso_p = r["PESOS"][node]
-            icon_html = f"""<div style="background:{color};color:white;border-radius:50%;
-                            width:30px;height:30px;display:flex;align-items:center;
-                            justify-content:center;font-size:13px;font-weight:bold;
-                            border:2px solid white;box-shadow:2px 2px 4px rgba(0,0,0,0.4);">{i}</div>"""
-            folium.Marker(
-                location=[lat, lon],
-                popup=f"<b>{r['NOMBRES'][node]}</b><br>🚛 Camión {c['camion']}<br>⏰ {hora_parada}<br>📦 {peso_p} kg",
-                tooltip=f"Camión {c['camion']} · {i}. {r['NOMBRES'][node]} — {hora_parada}",
-                icon=folium.DivIcon(html=icon_html, icon_size=(30, 30), icon_anchor=(15, 15)),
-            ).add_to(grupo)
-
-        grupo.add_to(m)
-
-    folium.LayerControl(position="topright", collapsed=True).add_to(m)
-    st_folium(m, use_container_width=True, height=520, returned_objects=[])
-
-    # ── Detalle por camión ──
-    st.subheader("📋 Detalle por camión")
-    tabs = st.tabs([f"🚛 Camión {c['camion']}" for c in camiones])
-    for tab, c in zip(tabs, camiones):
-        with tab:
-            tcol1, tcol2, tcol3 = st.columns(3)
-            tcol1.metric("📏 Distancia", f"{c['dist_total_km']:.1f} km")
-            tcol2.metric("📦 Peso recolectado", f"{c['peso_total_dia']:.0f} kg")
-            tcol3.metric("🕐 Hora fin", c["hora_fin"])
-            st.dataframe(pd.DataFrame(c["resumen"]), use_container_width=True, hide_index=True)
-
-    # ── Exportar ──
-    st.subheader("⬇️ Exportar")
-
-    df_todos = pd.concat(
-        [pd.DataFrame(c["resumen"]).assign(Camión=c["camion"]) for c in camiones],
-        ignore_index=True,
+    st.markdown(
+        f"**Toneladas netas del modelo actual:** {ton_actual_bruta:.2f} ton "
+        f"(total histórico) − {ton_nuevo:.2f} ton (absorbidas por el nuevo modelo) "
+        f"= **{ton_actual_neta:.2f} ton**"
     )
-    df_todos = df_todos[["Camión"] + [col for col in df_todos.columns if col != "Camión"]]
-    csv_todos = df_todos.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 CSV combinado (todos los camiones)", csv_todos,
-                       "rutas_todos_los_camiones.csv", "text/csv", use_container_width=True)
+    st.caption(
+        "El costo del modelo actual se calcula sobre las toneladas netas, "
+        "ya que las toneladas que recoge el modelo nuevo ya no están "
+        "disponibles para el modelo actual."
+    )
 
-    mapa_html = m.get_root().render().encode("utf-8")
-    st.download_button(
-        "🗺️ Mapa interactivo (HTML, para abrir sin internet)",
-        mapa_html, "mapa_rutas.html", "text/html", use_container_width=True,
+    costo_modelo_actual = ton_actual_neta * precio_actual
+    costo_modelo_nuevo = ton_nuevo * precio_nuevo
+    diferencia = costo_modelo_actual - costo_modelo_nuevo
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Costo modelo actual (neto)", f"CRC {costo_modelo_actual:,.2f}",
+              help=f"{ton_actual_neta:.2f} ton x CRC {precio_actual:,.2f}")
+    k2.metric("Costo modelo nuevo", f"CRC {costo_modelo_nuevo:,.2f}",
+              help=f"{ton_nuevo:.2f} ton x CRC {precio_nuevo:,.2f}")
+    k3.metric(
+        "Diferencia (ahorro)", f"CRC {diferencia:,.2f}",
+        delta=(f"{(diferencia / costo_modelo_actual * 100):.1f}%"
+               if costo_modelo_actual > 0 else None),
+        delta_color="normal" if diferencia >= 0 else "inverse",
     )
 
     st.divider()
-    st.markdown("**Exportar detalle de un camión específico (GPS / SIG / navegación):**")
-    camion_sel_num = st.selectbox(
-        "Camión a exportar", options=[c["camion"] for c in camiones],
-        format_func=lambda n: f"Camión {n}",
-    )
-    c_sel = next(c for c in camiones if c["camion"] == camion_sel_num)
-    r_sel = {
-        "ruta_nodos": c_sel["ruta_nodos"],
-        "segmentos": c_sel["segmentos"],
-        "resumen": c_sel["resumen"],
-        "LOCATIONS": r["LOCATIONS"],
-        "NOMBRES": r["NOMBRES"],
-        "PESOS": r["PESOS"],
-    }
-    df_sel = pd.DataFrame(c_sel["resumen"])
-    orden_locations = [r["LOCATIONS"][n] for n in c_sel["ruta_nodos"]]
+    st.subheader("⛽ Combustible y operación (informativo)")
+    st.caption("Sección de referencia: estos valores NO se suman a la comparación "
+               "de arriba. Sirven para estimar el costo operativo de las rutas "
+               "calculadas.")
 
-    col_e1, col_e2 = st.columns(2)
-    with col_e1:
-        csv_sel = df_sel.to_csv(index=False).encode("utf-8")
-        st.download_button(f"📥 CSV (Camión {camion_sel_num})", csv_sel,
-                           f"ruta_camion_{camion_sel_num}.csv", "text/csv",
-                           use_container_width=True)
-    with col_e2:
-        link_maps, demasiados_puntos = generar_link_google_maps(orden_locations)
-        st.link_button("🗺️ Abrir en Google Maps", link_maps, use_container_width=True)
-        if demasiados_puntos:
-            st.caption("⚠️ Más de 10 paradas: Google Maps solo muestra las primeras 10.")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        rendimiento = st.number_input(
+            "Rendimiento del camión (km por litro)", min_value=0.1, step=0.5,
+            format="%.2f", value=float(db.obtener_config("rendimiento", 5.0)),
+        )
+        precio_litro = st.number_input(
+            "Precio del combustible (CRC por litro)", min_value=0.0, step=10.0,
+            format="%.2f", value=float(db.obtener_config("precio_litro", 0)),
+        )
+    with col_f2:
+        costo_km_extra = st.number_input(
+            "Otros costos por km (CRC) — mantenimiento, llantas",
+            min_value=0.0, step=10.0, format="%.2f",
+            value=float(db.obtener_config("costo_km_extra", 0)),
+        )
+        costo_fijo_dia = st.number_input(
+            "Costos fijos por día (CRC) — salarios, seguros",
+            min_value=0.0, step=1000.0, format="%.2f",
+            value=float(db.obtener_config("costo_fijo_dia", 0)),
+        )
 
-    col_g1, col_g2 = st.columns(2)
-    with col_g1:
-        geojson_bytes = exportar_geojson(r_sel)
-        st.download_button("🌐 GeoJSON (QGIS / ArcGIS / web)",
-                           geojson_bytes, f"ruta_camion_{camion_sel_num}.geojson",
-                           "application/geo+json", use_container_width=True)
-    with col_g2:
-        shp_bytes = exportar_shapefile(r_sel)
-        st.download_button("📦 Shapefile (.zip)",
-                           shp_bytes, f"ruta_camion_{camion_sel_num}_shp.zip",
-                           "application/zip", use_container_width=True)
+    if st.button("Guardar parámetros de combustible"):
+        db.guardar_configuracion_general(
+            rendimiento=rendimiento, precio_litro=precio_litro,
+            costo_km_extra=costo_km_extra, costo_fijo_dia=costo_fijo_dia,
+        )
+        st.success("Parámetros guardados.")
 
-    col_g3, col_g4 = st.columns(2)
-    with col_g3:
-        gpx_bytes = exportar_gpx(r_sel)
-        st.download_button("📡 GPX (GPS / OsmAnd / Garmin)",
-                           gpx_bytes, f"ruta_camion_{camion_sel_num}.gpx",
-                           "application/gpx+xml", use_container_width=True)
-    with col_g4:
-        kml_bytes = exportar_kml(r_sel)
-        st.download_button("🌍 KML (Google Earth)",
-                           kml_bytes, f"ruta_camion_{camion_sel_num}.kml",
+    if not st.session_state.resultados:
+        st.info("Calcule las rutas para estimar el consumo (se necesitan los km recorridos).")
+    else:
+        r = st.session_state.resultados
+        km_total = sum(c["dist_total_m"] for c in r["camiones"]) / 1000
+        litros = km_total / rendimiento if rendimiento > 0 else 0
+        costo_combustible = litros * precio_litro
+        costo_variable = km_total * costo_km_extra
+        costo_operativo = costo_combustible + costo_variable + costo_fijo_dia
+
+        st.markdown(f"**Base del cálculo:** {km_total:.1f} km recorridos · "
+                    f"{litros:.1f} litros estimados")
+
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Combustible", f"CRC {costo_combustible:,.2f}")
+        f2.metric("Variables por km", f"CRC {costo_variable:,.2f}")
+        f3.metric("Fijos del día", f"CRC {costo_fijo_dia:,.2f}")
+        f4.metric("Costo operativo total", f"CRC {costo_operativo:,.2f}")
+
+        with st.expander("Ver desglose"):
+            desglose = pd.DataFrame([
+                {"Concepto": "Combustible", "Monto (CRC)": f"{costo_combustible:,.0f}",
+                 "Detalle": f"{litros:.1f} L x CRC {precio_litro:,.0f}"},
+                {"Concepto": "Costos variables por km", "Monto (CRC)": f"{costo_variable:,.0f}",
+                 "Detalle": f"{km_total:.1f} km x CRC {costo_km_extra:,.0f}"},
+                {"Concepto": "Costos fijos del día", "Monto (CRC)": f"{costo_fijo_dia:,.0f}",
+                 "Detalle": "Salarios, seguros, etc."},
+                {"Concepto": "TOTAL operativo", "Monto (CRC)": f"{costo_operativo:,.0f}",
+                 "Detalle": ""},
+                {"Concepto": "Costo operativo por tonelada",
+                 "Monto (CRC)": (f"{(costo_operativo / ton_nuevo):,.0f}"
+                                 if ton_nuevo > 0 else "-"),
+                 "Detalle": f"Sobre {ton_nuevo:.2f} ton del modelo nuevo"},
+            ])
+            st.dataframe(desglose, use_container_width=True, hide_index=True)
+
+# ══════════════ TAB EXPORTAR ══════════════
+with tab_exportar:
+    if not st.session_state.resultados:
+        st.info("Calculá las rutas primero.")
+    else:
+        r = st.session_state.resultados
+
+        st.subheader("📤 Exportar resultados")
+        st.markdown("##### Datos y SIG")
+        # CSV combinado con columna Camión
+        filas_csv = []
+        for c in r["camiones"]:
+            for fila in c["resumen"]:
+                f2 = {"Camión": c["nombre"], **{k: v for k, v in fila.items()
+                                                if k not in ("lat", "lon", "orden")}}
+                filas_csv.append(f2)
+        df_export = pd.DataFrame(filas_csv)
+
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            st.download_button("CSV (todas las rutas)",
+                               df_export.to_csv(index=False).encode("utf-8"),
+                               "rutas_optimas.csv", "text/csv", use_container_width=True)
+        with col_e2:
+            geojson_bytes = exportar_geojson(r)
+            st.download_button("GeoJSON (QGIS / ArcGIS / web)", geojson_bytes,
+                               "rutas_optimas.geojson", "application/geo+json",
+                               use_container_width=True)
+
+        col_e3, col_e4 = st.columns(2)
+        with col_e3:
+            shp_bytes = exportar_shapefile(r)
+            st.download_button("Shapefile (.zip)", shp_bytes, "rutas_optimas_shp.zip",
+                               "application/zip", use_container_width=True)
+            st.caption("Capas: rutas_lineas + rutas_puntos, con atributo de camión.")
+        with col_e4:
+            gpx_bytes = exportar_gpx(r)
+            st.download_button("GPX (OsmAnd / Garmin)", gpx_bytes, "rutas_optimas.gpx",
+                               "application/gpx+xml", use_container_width=True)
+            st.caption("Un track por camión.")
+
+        kml_bytes = exportar_kml(r)
+        st.download_button("KML (Google Earth / My Maps)", kml_bytes, "rutas_optimas.kml",
                            "application/vnd.google-earth.kml+xml", use_container_width=True)
 
-    with st.expander(f"Cómo usar con Waze (Camión {camion_sel_num})"):
-        st.markdown("""
-Waze **no tiene API pública de multi-paradas** como Google Maps.
-Tenés dos opciones:
+        st.divider()
+        st.markdown("##### Navegación")
+        st.markdown("**Google Maps por camión** (segmentos de máx. 10 paradas):")
+        for c in r["camiones"]:
+            stops = [(fila["lat"], fila["lon"]) for fila in c["resumen"]]
+            links = generar_links_google_maps(stops)
+            st.markdown(f"**{c['nombre']}:**")
+            cols = st.columns(min(len(links), 4))
+            for j, (label, url) in enumerate(links):
+                cols[j % len(cols)].link_button(label, url, use_container_width=True)
 
-**Opción A - Parada por parada (desde el celular):**
-El chofer toca el link de la primera parada, llega, cierra Waze, toca el segundo, y así.
-
-**Opción B - Importar GPX en OsmAnd (recomendado):**
-Descargá el GPX de arriba e importalo en [OsmAnd](https://osmand.net/) (gratis, Android/iOS).
-OsmAnd navega rutas GPX completas con instrucción por voz, igual que Waze.
-""")
-        for i, node in enumerate(c_sel["ruta_nodos"]):
-            if node == 0:
-                continue
-            lat, lon = r["LOCATIONS"][node]
-            nombre = r["NOMBRES"][node]
-            hora = c_sel["resumen"][i]["Hora llegada"]
-            es_ultimo = (i == len(c_sel["ruta_nodos"]) - 1)
-            if not es_ultimo:
-                waze_url = f"https://waze.com/ul?ll={lat},{lon}&navigate=yes"
-                st.markdown(f"**Parada {i} - {nombre}** ({hora}): [Abrir en Waze]({waze_url})")
+        with st.expander("Cómo usar con Waze"):
+            st.markdown(
+                "Waze no tiene API de multi-paradas. Opciones: **(A)** links parada por "
+                "parada abajo, o **(B)** importar el GPX en [OsmAnd](https://osmand.net/) "
+                "(gratis), que navega la ruta completa con voz."
+            )
+            for c in r["camiones"]:
+                st.markdown(f"**{c['nombre']}:**")
+                for fila in c["resumen"][1:-1]:
+                    waze_url = f"https://waze.com/ul?ll={fila['lat']},{fila['lon']}&navigate=yes"
+                    st.markdown(f"- Parada {fila['orden']} — {fila['Nombre']} "
+                                f"({fila['Hora llegada']}): [Abrir en Waze]({waze_url})")
