@@ -1,11 +1,73 @@
-# Optimizador de Rutas de Recolección — v5
+# Optimizador de Rutas de Recolección — v6
 
 Aplicación web (Streamlit) que calcula rutas óptimas de recolección para una
 flota de camiones, con horarios estimados, restricciones de capacidad,
-análisis de costos, mapa interactivo y exportación a formatos GIS y de
-navegación.
+múltiples viajes por camión, costo real por tonelada, mapa interactivo y
+exportación a formatos GIS y de navegación.
 
 ---
+
+## Qué cambió de la v5 a la v6
+
+### 1. Viajes múltiples por camión (cambio más grande de esta versión)
+
+Antes, cada camión hacía **un solo recorrido** por día: salía, recolectaba
+lo que le cupiera, y terminaba. Ahora un camión puede **llenarse, ir a
+descargar al depot de llegada, y volver a salir** a recolectar más — las
+veces que haga falta, hasta un máximo que vos definís por camión (columna
+**"Viajes máx."** en la pestaña Camiones).
+
+Técnicamente, cada camión se modela como varios "pseudo-vehículos"
+encadenados dentro de OR-Tools: el primero sale del depot de salida, los
+siguientes salen directo desde el depot de llegada (donde el camión ya
+estaba tras descargar). El optimizador decide solo, por camión, cuántos
+viajes usar — nunca más de los que permitiste, ni más de los necesarios.
+
+En el detalle por camión ahora se ve "Viajes usados: X de Y", y la tabla
+muestra cada descarga intermedia como una fila propia ("Descarga — fin
+viaje N").
+
+### 2. Personas por camión
+
+Nueva columna **"Personas"** en la pestaña Camiones (chofer + ayudantes).
+La mano de obra en la pestaña Costos ahora es:
+
+```
+Mano de obra = Horas laboradas × Precio por hora × Personas (de los camiones usados)
+```
+
+en vez de asumir una sola persona por camión.
+
+### 3. Plantel por camión (distinto del depot de llegada)
+
+El depot de llegada es donde el camión **descarga**; el plantel es donde
+**se guarda** al terminar la jornada, y puede ser distinto por camión
+(columnas **"Plantel Lat"** / **"Plantel Lon"** en Camiones). Si no se
+define, se asume que el camión se queda en el depot de llegada.
+
+Este tramo final no participa en la optimización de la ruta — se agrega
+siempre como el último paso, después de la última descarga real.
+
+### 4. Costo real por tonelada (calculado, no manual)
+
+La pestaña Costos ya no pide un precio a mano para el modelo nuevo: se
+calcula automáticamente a partir de combustible, mano de obra y otros
+costos fijos, dividido entre las toneladas que recolectaron las rutas
+optimizadas. El resultado (precio calculado + ahorro) se muestra arriba,
+junto a las toneladas de cada modelo.
+
+### 5. Mapa con más tipos de marcador
+
+Con viajes múltiples y plantel propio, el mapa ahora distingue:
+- **Depot salida** (casa roja) — una vez.
+- **Depot llegada** (flecha verde) — una vez, aunque varios camiones/viajes
+  pasen por ahí.
+- **Plantel** (bandera gris) — uno por camión, en sus propias coordenadas.
+- **Paradas de recolección** — círculos numerados, como antes.
+
+---
+
+# Historial — v5 (multi-camión, capacidad, depot de llegada)
 
 ## Qué cambió de la v4 a la v5
 

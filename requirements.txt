@@ -6,3 +6,4 @@ requests>=2.31
 pandas>=2.0
 geopandas>=0.14
 shapely>=2.0
+networkx>=3.0
