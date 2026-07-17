@@ -1,217 +1,100 @@
-# Optimizador de Rutas de Recolección — v6
+# Optimizador de Rutas de Recolección de Residuos — v7
 
 Aplicación web (Streamlit) que calcula rutas óptimas de recolección para una
 flota de camiones, con horarios estimados, restricciones de capacidad,
-múltiples viajes por camión, costo real por tonelada, mapa interactivo y
-exportación a formatos GIS y de navegación.
+múltiples viajes por camión, cálculo por Cantón/Distrito, costo real por
+tonelada, mapa interactivo, y exportación a formatos GIS y de navegación.
 
 ---
 
-## Qué cambió de la v5 a la v6
+## Metodología
 
-### 1. Viajes múltiples por camión (cambio más grande de esta versión)
+El núcleo del sistema es un problema de ruteo de vehículos (VRP) resuelto
+con OR-Tools (Google). Cada camión se modela con su propia capacidad, su
+propio plantel (de dónde sale y a dónde vuelve cada día), y la posibilidad
+de hacer varios viajes en el mismo día si se llena antes de terminar. Las
+distancias entre puntos se calculan sobre la red vial real mediante OSRM,
+en lugar de asumir línea recta.
 
-Antes, cada camión hacía **un solo recorrido** por día: salía, recolectaba
-lo que le cupiera, y terminaba. Ahora un camión puede **llenarse, ir a
-descargar al depot de llegada, y volver a salir** a recolectar más — las
-veces que haga falta, hasta un máximo que vos definís por camión (columna
-**"Viajes máx."** en la pestaña Camiones).
+Sobre esa base, el costo de operar las rutas se construye desde cinco
+categorías (inversión, mano de obra, combustible, mantenimiento y
+administrativa), cada una prorrateada a un equivalente diario, y se compara
+contra lo que cuesta el modelo de recolección actual.
 
-Técnicamente, cada camión se modela como varios "pseudo-vehículos"
-encadenados dentro de OR-Tools: el primero sale del depot de salida, los
-siguientes salen directo desde el depot de llegada (donde el camión ya
-estaba tras descargar). El optimizador decide solo, por camión, cuántos
-viajes usar — nunca más de los que permitiste, ni más de los necesarios.
+## Estructura de pestañas
 
-En el detalle por camión ahora se ve "Viajes usados: X de Y", y la tabla
-muestra cada descarga intermedia como una fila propia ("Descarga — fin
-viaje N").
-
-### 2. Personas por camión
-
-Nueva columna **"Personas"** en la pestaña Camiones (chofer + ayudantes).
-La mano de obra en la pestaña Costos ahora es:
-
-```
-Mano de obra = Horas laboradas × Precio por hora × Personas (de los camiones usados)
-```
-
-en vez de asumir una sola persona por camión.
-
-### 3. Plantel por camión (distinto del depot de llegada)
-
-El depot de llegada es donde el camión **descarga**; el plantel es donde
-**se guarda** al terminar la jornada, y puede ser distinto por camión
-(columnas **"Plantel Lat"** / **"Plantel Lon"** en Camiones). Si no se
-define, se asume que el camión se queda en el depot de llegada.
-
-Este tramo final no participa en la optimización de la ruta — se agrega
-siempre como el último paso, después de la última descarga real.
-
-### 4. Costo real por tonelada (calculado, no manual)
-
-La pestaña Costos ya no pide un precio a mano para el modelo nuevo: se
-calcula automáticamente a partir de combustible, mano de obra y otros
-costos fijos, dividido entre las toneladas que recolectaron las rutas
-optimizadas. El resultado (precio calculado + ahorro) se muestra arriba,
-junto a las toneladas de cada modelo.
-
-### 5. Mapa con más tipos de marcador
-
-Con viajes múltiples y plantel propio, el mapa ahora distingue:
-- **Depot salida** (casa roja) — una vez.
-- **Depot llegada** (flecha verde) — una vez, aunque varios camiones/viajes
-  pasen por ahí.
-- **Plantel** (bandera gris) — uno por camión, en sus propias coordenadas.
-- **Paradas de recolección** — círculos numerados, como antes.
-
----
-
-# Historial — v5 (multi-camión, capacidad, depot de llegada)
-
-## Qué cambió de la v4 a la v5
-
-### 1. Multi-camión real (el cambio más importante)
-
-| | v4 | v5 |
-|---|---|---|
-| Vehículos | 1 solo, fijo en el código | Los que definas, cada uno con nombre propio |
-| Capacidad | Un límite global que solo **avisaba** si se excedía, después de calcular | Restricción **dura** dentro del optimizador: ningún camión puede exceder su capacidad |
-| Reparto | No existía — todo iba a un camión | OR-Tools reparte los puntos entre camiones automáticamente |
-
-En la v4, el solver tenía `num_vehicles=1` fijo: aunque existieran más
-camiones, se ignoraban. La v5 usa `AddDimensionWithVehicleCapacity` de
-OR-Tools, que convierte la capacidad en una restricción del problema: si el
-peso total no cabe en un camión, el reparto entre varios es obligatorio.
-
-**Comportamiento a conocer:** si todo el peso cabe en un solo camión, el
-optimizador usa uno solo — es la solución de menor distancia. Para forzar el
-reparto entre todos igualmente, existe el checkbox **"Balancear rutas entre
-camiones"** en la barra lateral.
-
-### 2. Capacidad individual por camión
-
-Nueva pestaña **Camiones**: una fila por camión con su capacidad propia
-(ej.: Camión 1 = 5.000 kg, Camión 2 = 15.000 kg). El optimizador respeta la
-capacidad de **cada uno**, no un promedio ni un total.
-
-### 3. Asignación manual de puntos a camiones
-
-La tabla de puntos tiene una columna nueva **"Camión"**: con "Auto" el
-optimizador decide; eligiendo un camión específico, ese punto queda fijado a
-él y el resto de la ruta se optimiza alrededor de esa decisión.
-
-### 4. Depot de salida y de llegada distintos
-
-En la v4 la ruta era siempre circular (salía y volvía al mismo punto). En la
-v5, un checkbox en la barra lateral ("El depot de llegada es distinto")
-permite definir coordenadas de llegada separadas — útil cuando los camiones
-terminan en un relleno sanitario, centro de acopio u otra bodega. El
-optimizador considera ese destino final al ordenar las paradas. En el mapa,
-la salida se marca con casa roja y la llegada con bandera verde.
-
-### 5. Pestaña de Costos (nueva)
-
-Dos secciones independientes:
-
-- **Comparación de modelos de ruta** — 4 entradas: toneladas y precio por
-  tonelada del *modelo actual*, y toneladas y precio por tonelada del
-  *modelo nuevo*. Las toneladas del modelo nuevo se pre-llenan con el peso
-  de las rutas calculadas (editables). Muestra el costo de cada modelo y la
-  diferencia con porcentaje de ahorro.
-- **Combustible y operación (informativo)** — rendimiento km/L, precio del
-  combustible, otros costos por km y fijos del día. Estima el costo
-  operativo de las rutas calculadas. **No se suma** a la comparación de
-  arriba; es solo de referencia.
-
-### 6. Interfaz reorganizada y rediseñada
-
-- **Pestañas**: Puntos / Camiones / Resultados / Costos / Exportar, en lugar
-  de una sola página larga y saturada.
-- **Accesibilidad**: tipografía base más grande (17 px), pestañas a 1.4 rem,
-  métricas y tablas ampliadas — pensado para vista reducida.
-- **Estilo profesional**: emojis solo donde aportan (pestañas y títulos),
-  botones con bordes definidos, tema claro consistente vía
-  `.streamlit/config.toml`.
-- **Popups del mapa rediseñados**: tarjeta con nombre del punto, camión,
-  hora de llegada y peso en tabla alineada, sin quiebres de texto.
-
-### 7. Mapa mejorado
-
-- Un **color por camión** (ruta y marcadores numerados).
-- Control de **capas**: Mapa estándar / Satélite (Esri) / Claro / Oscuro.
-- Botón de **pantalla completa**.
-- Altura ampliada (760 px) para ver más zona de una vez.
-
-### 8. Exportadores multi-camión
-
-Todos los formatos ahora incluyen todas las rutas con su camión como
-atributo:
-
-| Formato | Contenido |
+| Pestaña | Qué hace |
 |---|---|
-| CSV | Todas las paradas con columna "Camión" |
-| GeoJSON | Una línea por camión + puntos con propiedades |
-| Shapefile (.zip) | Capas `rutas_lineas` y `rutas_puntos` |
-| GPX | Un track por camión + waypoints |
-| KML | Una carpeta por camión, líneas con el color del camión |
-| Google Maps | Links por camión, divididos en segmentos de máx. 10 paradas |
-| Waze | Links parada por parada (Waze no soporta multi-paradas) |
+| **Puntos** | Carga de paradas: nombre, dirección, coordenadas, peso, cantón, distrito, camión asignado (opcional). Avisa si algún punto pesa más de lo que cualquier camión puede levantar en un solo viaje. |
+| **Camiones** | Flota: capacidad, personas, viajes máximos por día, plantel (obligatorio), y Cantón/Distrito asignado (opcional, para restringir en qué zonas puede trabajar). |
+| **Resultados** | Mapa con selector de rutas individuales (color propio por camión y por viaje), detalle de paradas y horarios. Cuando se calcula por lotes, todas las zonas quedan combinadas en un único resultado — cada camión etiquetado con su zona, y el mismo selector de rutas permite ver una zona sola, varias juntas, o todas a la vez. |
+| **Costos** | Comparación modelo actual vs. modelo nuevo; estructura completa de costos (inversión, mano de obra, combustible, mantenimiento, administrativa); costo real por tonelada calculado automáticamente. |
+| **Exportar** | CSV, GeoJSON, Shapefile, GPX, KML, y links directos a Google Maps y Waze. |
+| **Red propia (Beta)** | Rutea sobre un shapefile de calles propio en vez de la red pública de OpenStreetMap. |
+| **Recolección en vía (Beta)** | Estima kilogramos adicionales según el tipo de calle que atraviesa cada ruta (autopista, primaria, residencial, etc.), con mapa de verificación y capas activables. Opcionalmente, ese kg extra puede sumarse como recolección real y reflejarse en Costos. |
 
-### 9. Arquitectura: archivo único
+## Cálculo por zona geográfica
 
-La v4 usaba dos archivos (`app.py` + `db.py`), lo que causó errores de
-desincronización al actualizar solo uno. La v5 integra la capa de base de
-datos dentro de `app.py`: **un solo archivo**, imposible de desincronizar.
+Arriba del botón "Calcular Rutas Óptimas" hay un selector de modo:
 
-### 10. Otras mejoras técnicas
+- **Todos los puntos juntos** — el comportamiento clásico, sin agrupar.
+- **Una ruta por Distrito** / **Una ruta por Cantón** — calcula una ruta
+  **independiente** por cada valor distinto de esa columna en Puntos, cada
+  una con su propia flota completa (los camiones no se comparten entre
+  zonas, salvo que se restrinjan — ver más abajo).
+- **Mixto** — se elige, cantón por cantón, si ese cantón se calcula como
+  una sola ruta completa o dividido por distrito (por ejemplo, un cantón a
+  nivel cantonal y otro dividido en sus distritos, en el mismo cálculo).
 
-- OSRM: una sola llamada multi-waypoint por camión (v4 hacía una llamada
-  HTTP por cada tramo).
-- Tiempo límite del optimizador dinámico según cantidad de puntos
-  (10–60 s), en lugar de 10 s fijos.
-- Links de Google Maps segmentados automáticamente cuando hay más de 10
-  paradas (v4 truncaba la ruta en la parada 10).
-- Alerta preventiva: la pestaña Puntos avisa si el peso ya excede la
-  capacidad de la flota, antes de calcular.
+En los tres modos por zona, el resultado de todas las zonas calculadas
+queda **combinado en una sola vista** en la pestaña Resultados — no hace
+falta cambiar entre ellas, se muestran o esconden individualmente con el
+selector de rutas del mapa.
 
----
+### Restringir camiones a zonas específicas
 
-## Estructura del proyecto
+En la pestaña Camiones, las columnas opcionales **"Cantón asignado"** y
+**"Distrito asignado"** permiten limitar en qué zonas puede trabajar cada
+camión:
 
-```
-modelo_rutas\
-├── app.py                  Aplicación completa (incluye la base de datos)
-├── rutas.db                Se crea sola; guarda puntos, camiones y configuración
-├── requirements.txt        Dependencias
-└── .streamlit\
-    └── config.toml         Tema claro de la aplicación
-```
+- Ambas vacías → el camión es comodín, disponible en cualquier zona.
+- Con Cantón asignado → disponible en cualquier distrito de ese cantón.
+- Con Distrito asignado → restringido solo a ese distrito puntual.
 
-## Instalación y ejecución
+Si una zona se queda sin ningún camión disponible, la app avisa
+exactamente cuál y por qué.
+
+## Recolección en vía: detalle
+
+Esta pestaña es un análisis de solo lectura sobre las rutas ya calculadas
+— no modifica pesos, capacidades ni costos por defecto:
+
+- Descarga la red vial clasificada de OpenStreetMap una sola vez por
+  cálculo (no una vez por camión), y **deduplica por vía física real**: si
+  un camión pasa dos veces por la misma calle (varios viajes), o dos
+  camiones comparten un tramo, esa vía se cuenta una sola vez.
+- Los tramos largos del recorrido se subdividen en pedazos de ~150 m antes
+  de clasificar el tipo de vía, para no depender de un solo punto medio
+  cuando un tramo en realidad cruza dos tipos de vía distintos.
+- El mapa tiene capas activables por camión, distinguiendo lo que sí se
+  contó de lo que se saltó por estar repetido, con el kilometraje de cada
+  capa en su propio nombre.
+- Con el checkbox "Sumar este kg extra a la cantidad total recolectada",
+  ese peso se refleja en la pestaña Costos (toneladas del modelo nuevo), y
+  se puede ver el detalle progresivo de cómo se va llenando cada camión
+  parada por parada. Recalcular las rutas invalida automáticamente estos
+  datos, para que nunca queden desactualizados sin darse cuenta.
+
+## Instalación
 
 ```bash
 pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-La primera vez se crea `rutas.db` automáticamente. Para reiniciar todos los
-datos, basta con borrar ese archivo.
+La primera vez se crea `rutas.db` automáticamente. Las bases de datos de
+versiones anteriores se migran solas al arrancar — las columnas nuevas se
+agregan sin perder los datos existentes.
 
-## Compatibilidad de datos
-
-La base `rutas.db` de la v4 es compatible: la tabla de camiones se crea
-sola al arrancar y los puntos guardados se conservan. Los parámetros de la
-pestaña Costos usan claves nuevas, por lo que deben cargarse una vez y
-guardarse.
-
-## Flujo de uso típico
-
-1. **Camiones**: definir la flota con capacidades.
-2. **Puntos**: cargar paradas (coordenadas o dirección + geocodificar),
-   pesos y, si aplica, camión fijo.
-3. Barra lateral: hora de inicio, velocidad, depot(s).
-4. **Calcular Rutas Óptimas**.
-5. **Resultados**: mapa por colores y detalle por camión.
-6. **Costos**: comparación de modelos y estimación de combustible.
-7. **Exportar**: CSV, GIS o navegación.
+Dependencias: `networkx` (Red propia) y `osmnx` (Recolección en vía), ya
+incluidas en `requirements.txt`.

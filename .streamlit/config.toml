@@ -1,21 +1,10 @@
 # Tema de la aplicación — Optimizador de Rutas
-# ==============================================
-# UBICACIÓN: este archivo debe ir en una carpeta llamada ".streamlit"
-# dentro de la carpeta del proyecto:
-#
-#   modelo_rutas\
-#   ├── app.py
-#   ├── rutas.db
-#   └── .streamlit\
-#       └── config.toml   <── este archivo
-#
-# Con esto la app siempre abre en tema claro, sin importar la
-# configuración del navegador o del sistema del usuario.
+
 
 [theme]
 base = "light"
 primaryColor = "#2563EB"
-backgroundColor = "#FFFFFF"
+backgroundColor = "#ffffff"  
 secondaryBackgroundColor = "#F4F6FA"
 textColor = "#1F2937"
 font = "sans serif"
